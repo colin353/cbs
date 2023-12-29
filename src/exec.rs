@@ -23,7 +23,17 @@ pub struct TaskGraph {
 impl Executor {
     pub fn new() -> Self {
         Self {
-            context: Context::new(std::path::PathBuf::from("/tmp/cache")),
+            context: Context::new(std::path::PathBuf::from("/tmp/cache"), std::iter::empty()),
+            tasks: Mutex::new(TaskGraph::new()),
+
+            resolvers: Vec::new(),
+            builders: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_config<T: IntoIterator<Item = (BuildConfigKey, String)>>(config: T) -> Self {
+        Self {
+            context: Context::new(std::path::PathBuf::from("/tmp/cache"), config),
             tasks: Mutex::new(TaskGraph::new()),
 
             resolvers: Vec::new(),
@@ -417,7 +427,11 @@ mod tests {
 
     #[test]
     fn test_cargo_build() {
-        let mut e = Executor::new();
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
         e.builders
             .lock()
             .unwrap()

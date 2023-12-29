@@ -10,6 +10,14 @@ pub struct Context {
     pub target: Option<String>,
     pub target_hash: Option<u64>,
     pub logs: Arc<RwLock<HashMap<String, Mutex<Vec<String>>>>>,
+    pub config: Arc<HashMap<BuildConfigKey, String>>,
+}
+
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+pub enum BuildConfigKey {
+    TargetFamily,
+    TargetEnv,
+    TargetOS,
 }
 
 #[derive(Debug, Clone)]

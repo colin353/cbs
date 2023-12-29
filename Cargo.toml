@@ -10,3 +10,5 @@ hyper = "0.13.10"
 tokio = { version = "0.2.25", features = ["full"] }
 hyper-tls = "0.4.3"
 futures = "0.3.21"
+toml = "0.8.8"
+serde = "1.0.193"

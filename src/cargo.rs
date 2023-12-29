@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::core::{Config, ConfigExtraKeys, Context, ResolverPlugin};
+use crate::core::{BuildConfigKey, Config, ConfigExtraKeys, Context, ResolverPlugin};
 use crate::plugins::PluginKind;
 
 #[derive(Debug)]
@@ -41,6 +41,125 @@ fn parse_lockstring(l: &str) -> (&str, Vec<&str>) {
     let version = components.next().expect("always get at least one split");
     let features = components.collect();
     (version, features)
+}
+
+#[derive(Debug)]
+struct CargoToml {
+    dependencies: Vec<String>,
+}
+
+fn parse_cargo_toml(
+    context: &Context,
+    filename: &std::path::Path,
+    features: &[&str],
+) -> std::io::Result<CargoToml> {
+    let content = std::fs::read_to_string(filename)?;
+    let table = content
+        .parse::<toml::Table>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let targets = table.get("target");
+    let target_deps_iter = targets
+        .iter()
+        .filter_map(|v| {
+            if let toml::Value::Table(t) = v {
+                return Some(t);
+            }
+            None
+        })
+        .flatten()
+        .filter_map(|(k, v)| {
+            if k.starts_with("cfg(") {
+                if !resolve_cfg_directive(context, &k[4..k.len() - 1]).ok()? {
+                    return None;
+                }
+            }
+
+            if let toml::Value::Table(t) = v {
+                if let Some(toml::Value::Table(t)) = v.get("dependencies") {
+                    return Some(t);
+                }
+            }
+            None
+        })
+        .flatten();
+    let deps_table = table.get("dependencies");
+    let deps_table_iter = deps_table
+        .iter()
+        .filter_map(|v| {
+            if let toml::Value::Table(t) = v {
+                return Some(t);
+            }
+            None
+        })
+        .flatten()
+        .chain(target_deps_iter);
+
+    let mut dependencies = Vec::new();
+    for (k, v) in deps_table_iter {
+        // Exclude optional dependencies
+        if let toml::Value::Table(t) = v {
+            if matches!(v.get("optional"), Some(toml::Value::Boolean(true))) {
+                continue;
+            }
+        }
+
+        dependencies.push(k.to_string());
+    }
+
+    let mut all_features = HashSet::new();
+    if let Some(toml::Value::Table(t)) = table.get("features") {
+        for (k, v) in t {
+            all_features.insert(k);
+        }
+    }
+
+    let mut optional_deps = HashSet::new();
+    if let Some(toml::Value::Table(t)) = table.get("features") {
+        for (k, v) in t {
+            if features.iter().find(|fname| k == *fname).is_none() {
+                continue;
+            }
+            if let toml::Value::Array(deps) = v {
+                for dep in deps {
+                    if let toml::Value::String(dname) = dep {
+                        // dep: prefix allows resolution of dependencies with the same name
+                        // as features.
+                        if dname.starts_with("dep:") {
+                            optional_deps.insert(dname[4..].to_string());
+                            continue;
+                        }
+
+                        // If a feature exists with this name, it represents a feature constraint
+                        // and not a dependency constraint.
+                        if all_features.contains(&dname) {
+                            continue;
+                        }
+
+                        // If it contains a slash, it's a dependency feature constraint.
+                        if dname.contains('/') {
+                            continue;
+                        }
+
+                        // Must be a dependency
+                        optional_deps.insert(dname.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    dependencies.extend(optional_deps.into_iter());
+
+    Ok(CargoToml { dependencies })
+}
+
+// TODO: properly implement this (need to actually parse the cfg directive...)
+fn resolve_cfg_directive(context: &Context, directive: &str) -> std::io::Result<bool> {
+    if directive == "unix" && context.get_config(BuildConfigKey::TargetFamily) == Some("unix") {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 impl ResolverPlugin for CargoResolver {
@@ -97,23 +216,14 @@ impl ResolverPlugin for CargoResolver {
         let mut extras = HashMap::new();
         extras.insert(
             ConfigExtraKeys::Features,
-            features.into_iter().map(|s| s.to_string()).collect(),
+            features.iter().map(|s| s.to_string()).collect(),
         );
 
-        // TODO: read the actual TOML and generate this...
+        let toml = parse_cargo_toml(&context, &dest.join("Cargo.toml"), &features)?;
+
         let mut deps = Vec::new();
-        if target == "cargo://rand" {
-            deps.push("cargo://rand_core".to_string());
-            deps.push("cargo://libc".to_string());
-            deps.push("cargo://rand_chacha".to_string());
-        } else if target == "cargo://rand_chacha" {
-            deps.push("cargo://rand_core".to_string());
-            deps.push("cargo://ppv-lite86".to_string());
-        } else if target == "cargo://rand_core" {
-            deps.push("cargo://getrandom".to_string());
-        } else if target == "cargo://getrandom" {
-            deps.push("cargo://libc".to_string());
-            deps.push("cargo://cfg-if".to_string());
+        for dep in toml.dependencies {
+            deps.push(format!("cargo://{dep}"));
         }
 
         Ok(Config {

@@ -1,10 +1,13 @@
-use crate::core::{BuildActions, Context, Task};
+use crate::core::{BuildActions, BuildConfigKey, Context, Task};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 impl Context {
-    pub fn new(cache_dir: std::path::PathBuf) -> Self {
+    pub fn new<T: IntoIterator<Item = (BuildConfigKey, String)>>(
+        cache_dir: std::path::PathBuf,
+        config: T,
+    ) -> Self {
         Self {
             actions: BuildActions::new(),
             lockfile: Arc::new(HashMap::new()),
@@ -13,7 +16,12 @@ impl Context {
             target: None,
             target_hash: None,
             logs: Arc::new(RwLock::new(HashMap::new())),
+            config: Arc::new(config.into_iter().collect()),
         }
+    }
+
+    pub fn get_config(&self, key: BuildConfigKey) -> Option<&str> {
+        self.config.get(&key).map(|s| s.as_str())
     }
 
     pub fn with_target(&self, target: &str) -> Self {
