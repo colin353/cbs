@@ -1,4 +1,6 @@
+use sha2::Digest;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
@@ -11,11 +13,12 @@ pub struct Context {
     pub target_hash: Option<u64>,
     pub logs: Arc<RwLock<HashMap<String, Mutex<Vec<String>>>>>,
     pub config: Arc<HashMap<BuildConfigKey, String>>,
+    pub hash: u64,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
 pub enum BuildConfigKey {
-    TargetFamily,
+    TargetFamily = 1,
     TargetEnv,
     TargetOS,
 }
@@ -103,6 +106,45 @@ impl Config {
         out.push(self.build_plugin.as_str());
         out.extend(self.build_dependencies.iter().map(|s| s.as_str()));
         out
+    }
+
+    // Only possible when all dependencies are resolved
+    pub fn calculate_hash(&mut self, context_hash: u64, deps_hash: u64) -> u64 {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(context_hash.to_be_bytes());
+        hasher.update(deps_hash.to_be_bytes());
+        for src in &self.sources {
+            let mut buffer = [0; 1024];
+            let f = match std::fs::File::open(src) {
+                Ok(f) => f,
+                Err(_) => {
+                    // Sentinel value to represent missing/inaccessible file
+                    hasher.update(&[0x12, 0x34]);
+                    continue;
+                }
+            };
+            let mut r = std::io::BufReader::new(f);
+            loop {
+                let count = match r.read(&mut buffer) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        hasher.update(&[0x56, 0x78]);
+                        continue;
+                    }
+                };
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[0..count]);
+            }
+        }
+        self.hash = u64::from_be_bytes(
+            hasher.finalize()[..8]
+                .try_into()
+                .expect("invalid hash size"),
+        );
+
+        self.hash
     }
 
     pub fn get(&self, key: u32) -> &[String] {

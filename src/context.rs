@@ -1,4 +1,5 @@
 use crate::core::{BuildActions, BuildConfigKey, Context, Task};
+use sha2::Digest;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,11 +18,28 @@ impl Context {
             target_hash: None,
             logs: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(config.into_iter().collect()),
+            hash: 0,
         }
     }
 
     pub fn get_config(&self, key: BuildConfigKey) -> Option<&str> {
         self.config.get(&key).map(|s| s.as_str())
+    }
+
+    pub fn calculate_hash(&mut self) -> u64 {
+        let mut hasher = sha2::Sha256::new();
+        let mut cfg_values: Vec<_> = self.config.iter().collect();
+        cfg_values.sort_by_key(|(k, _)| **k as u32);
+        for (k, v) in cfg_values {
+            hasher.update((*k as u32).to_be_bytes());
+            hasher.update(v.as_bytes());
+        }
+        self.hash = u64::from_be_bytes(
+            hasher.finalize()[..8]
+                .try_into()
+                .expect("invalid hash size"),
+        );
+        self.hash
     }
 
     pub fn with_target(&self, target: &str) -> Self {
@@ -88,7 +106,7 @@ impl Context {
                 .cache_dir
                 .join("build")
                 .join("scratch")
-                .join(format!("{}-{h}", to_dir(t))),
+                .join(format!("{}-{h:x}", to_dir(t))),
             (None, None) => self.cache_dir.clone(),
             _ => panic!("must have attached target if hash is present!"),
         }
@@ -107,7 +125,7 @@ impl Context {
             (Some(t), Some(h)) => self
                 .cache_dir
                 .join("build")
-                .join(format!("{}-{h}", to_dir(t))),
+                .join(format!("{}-{h:x}", to_dir(t))),
             (None, None) => self.cache_dir.clone(),
             _ => panic!("must have attached target if hash is present!"),
         }

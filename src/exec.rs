@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use sha2::Digest;
+
 use crate::core::*;
 use crate::plugins::PluginKind;
 
@@ -22,8 +24,11 @@ pub struct TaskGraph {
 
 impl Executor {
     pub fn new() -> Self {
+        let mut context = Context::new(std::path::PathBuf::from("/tmp/cache"), std::iter::empty());
+        context.calculate_hash();
+
         Self {
-            context: Context::new(std::path::PathBuf::from("/tmp/cache"), std::iter::empty()),
+            context,
             tasks: Mutex::new(TaskGraph::new()),
 
             resolvers: Vec::new(),
@@ -32,8 +37,10 @@ impl Executor {
     }
 
     pub fn with_config<T: IntoIterator<Item = (BuildConfigKey, String)>>(config: T) -> Self {
+        let mut context = Context::new(std::path::PathBuf::from("/tmp/cache"), config);
+        context.calculate_hash();
         Self {
-            context: Context::new(std::path::PathBuf::from("/tmp/cache"), config),
+            context,
             tasks: Mutex::new(TaskGraph::new()),
 
             resolvers: Vec::new(),
@@ -48,7 +55,7 @@ impl Executor {
         let exists = graph.by_target.contains_key(&target);
         let id = graph.add_task(target, rdep);
         if !exists && is_builder {
-            graph.mark_build_success(id, BuildResult::noop());
+            graph.mark_build_success(id, BuildResult::noop(), 0);
         }
         id
     }
@@ -156,10 +163,10 @@ impl Executor {
         );
     }
 
-    pub fn build(&self, task: Task) {
+    pub fn build(&self, mut task: Task) {
         let config = task
             .config
-            .as_ref()
+            .as_mut()
             .expect("must have config resolved before build can begin!");
 
         let plugin = {
@@ -189,21 +196,21 @@ impl Executor {
             }
         };
 
+        let mut dep_hash = sha2::Sha256::new();
         let mut deps = HashMap::new();
         {
             let graph = self.tasks.lock().unwrap();
-            for dep in task
-                .config
-                .as_ref()
-                .expect("task must have config defined by now!")
-                .dependencies()
-            {
+            for dep in config.dependencies() {
                 let dt = match graph.by_target.get(dep) {
                     Some(t) => &graph.tasks[*t],
                     None => {
                         panic!("all dependencies must exist by now!");
                     }
                 };
+
+                if let Some(cfg) = dt.config.as_ref() {
+                    dep_hash.update(cfg.hash.to_be_bytes());
+                }
 
                 match dt.result.as_ref() {
                     Some(BuildResult::Success(out)) => {
@@ -217,10 +224,19 @@ impl Executor {
             }
         }
 
-        let result = plugin.build(self.context.with_task(&task), task.clone(), deps);
+        let dep_hash = u64::from_be_bytes(
+            dep_hash.finalize()[..8]
+                .try_into()
+                .expect("invalid hash size"),
+        );
+        let hash = config.calculate_hash(self.context.hash, dep_hash);
+
+        let _t = task.clone();
+        let ctx = self.context.with_task(&_t);
+        let result = plugin.build(ctx, _t, deps);
         match result {
             BuildResult::Success { .. } => {
-                self.mark_build_success(task.id, result);
+                self.mark_build_success(task.id, result, hash);
             }
             BuildResult::Failure(_) => {
                 self.mark_task_failure(task.id, result);
@@ -262,8 +278,11 @@ impl Executor {
         }
     }
 
-    pub fn mark_build_success(&self, id: usize, result: BuildResult) {
-        self.tasks.lock().unwrap().mark_build_success(id, result);
+    pub fn mark_build_success(&self, id: usize, result: BuildResult, hash: u64) {
+        self.tasks
+            .lock()
+            .unwrap()
+            .mark_build_success(id, result, hash);
     }
 }
 
@@ -313,9 +332,12 @@ impl TaskGraph {
         }
     }
 
-    pub fn mark_build_success(&mut self, id: usize, result: BuildResult) {
+    pub fn mark_build_success(&mut self, id: usize, result: BuildResult, hash: u64) {
         self.tasks[id].result = Some(result);
         self.tasks[id].available = true;
+        if let Some(config) = self.tasks[id].config.as_mut() {
+            config.hash = hash;
+        }
         for rdep in &self.rdeps[id] {
             self.tasks[*rdep].dependencies_ready += 1;
         }
@@ -344,36 +366,6 @@ mod tests {
             .lock()
             .unwrap()
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
-        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
-            (
-                "//:builder",
-                Ok(Config {
-                    build_plugin: "@filesystem".to_string(),
-                    location: Some("/tmp/file.txt".to_string()),
-                    ..Default::default()
-                }),
-            ),
-            (
-                "//:my_target",
-                Ok(Config {
-                    build_plugin: "//:builder".to_string(),
-                    ..Default::default()
-                }),
-            ),
-        ])));
-        let id = e.add_task("//:my_target", None);
-        let result = e.run(&[id]);
-        assert_eq!(result, BuildResult::noop());
-    }
-
-    //#[test]
-    fn test_library_build() {
-        let mut e = Executor::new();
-        e.builders
-            .lock()
-            .unwrap()
-            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
-
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
                 "//:lhello",
