@@ -2,7 +2,7 @@ use futures::StreamExt;
 use std::io::Write;
 use tokio::runtime::Runtime;
 
-use crate::core::{BuildActions, BuildResult, Context};
+use crate::core::{BuildActions, Context};
 
 async fn download(mut url: hyper::Uri, dest: std::path::PathBuf) -> std::io::Result<()> {
     let https = hyper_tls::HttpsConnector::new();
@@ -103,7 +103,7 @@ impl BuildActions {
         let url = url.into();
 
         context.log(format!("download URL: {url}"));
-        let url = url.parse().map_err(|e| {
+        let url = url.parse().map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid URL: {}", url),

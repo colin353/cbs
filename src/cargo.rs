@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::core::{BuildConfigKey, Config, ConfigExtraKeys, Context, ResolverPlugin};
-use crate::plugins::PluginKind;
+use crate::core::{config_extra_keys, BuildConfigKey, Config, Context, ResolverPlugin};
+use crate::plugins::plugin_kind;
 
 #[derive(Debug)]
 pub struct CargoResolver {}
@@ -75,7 +75,7 @@ fn parse_cargo_toml(
                 }
             }
 
-            if let toml::Value::Table(t) = v {
+            if let toml::Value::Table(_) = v {
                 if let Some(toml::Value::Table(t)) = v.get("dependencies") {
                     return Some(t);
                 }
@@ -98,7 +98,7 @@ fn parse_cargo_toml(
     let mut dependencies = Vec::new();
     for (k, v) in deps_table_iter {
         // Exclude optional dependencies
-        if let toml::Value::Table(t) = v {
+        if let toml::Value::Table(_) = v {
             if matches!(v.get("optional"), Some(toml::Value::Boolean(true))) {
                 continue;
             }
@@ -109,7 +109,7 @@ fn parse_cargo_toml(
 
     let mut all_features = HashSet::new();
     if let Some(toml::Value::Table(t)) = table.get("features") {
-        for (k, v) in t {
+        for (k, _) in t {
             all_features.insert(k);
         }
     }
@@ -215,7 +215,7 @@ impl ResolverPlugin for CargoResolver {
 
         let mut extras = HashMap::new();
         extras.insert(
-            ConfigExtraKeys::Features,
+            config_extra_keys::FEATURES,
             features.iter().map(|s| s.to_string()).collect(),
         );
 
@@ -235,7 +235,7 @@ impl ResolverPlugin for CargoResolver {
                 .map(|s| s.to_string_lossy().to_string())
                 .collect(),
             build_dependencies: vec!["@rust_compiler".to_string()],
-            kind: PluginKind::RustLibrary.to_string(),
+            kind: plugin_kind::RUST_LIBRARY.to_string(),
             extras,
             hash: 1010,
         })

@@ -43,8 +43,8 @@ pub enum BuildResult {
     Failure(String),
 }
 
-pub mod BuildOutputKind {
-    pub const TransitiveProducts: u32 = 0;
+pub mod build_output_kind {
+    pub const TRANSITIVE_PRODUCTS: u32 = 0;
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -96,8 +96,8 @@ pub struct Config {
     pub hash: u64,
 }
 
-pub mod ConfigExtraKeys {
-    pub const Features: u32 = 0;
+pub mod config_extra_keys {
+    pub const FEATURES: u32 = 0;
 }
 
 impl Config {
@@ -221,9 +221,9 @@ pub struct FakeBuilder {}
 impl BuildPlugin for FakeBuilder {
     fn build(
         &self,
-        context: Context,
-        task: Task,
-        dependencies: HashMap<String, BuildOutput>,
+        _context: Context,
+        _task: Task,
+        _dependencies: HashMap<String, BuildOutput>,
     ) -> BuildResult {
         BuildResult::noop()
     }
@@ -252,11 +252,11 @@ impl FakeResolver {
 }
 
 impl ResolverPlugin for FakeResolver {
-    fn can_resolve(&self, target: &str) -> bool {
+    fn can_resolve(&self, _target: &str) -> bool {
         true
     }
 
-    fn resolve(&self, context: Context, target: &str) -> std::io::Result<Config> {
+    fn resolve(&self, _context: Context, target: &str) -> std::io::Result<Config> {
         match self.configs.get(target) {
             Some(Ok(c)) => Ok(c.clone()),
             Some(Err(e)) => Err(std::io::Error::new(e.kind(), "failed to read config")),
@@ -274,9 +274,9 @@ pub struct FilesystemBuilder {}
 impl BuildPlugin for FilesystemBuilder {
     fn build(
         &self,
-        context: Context,
+        _context: Context,
         task: Task,
-        deps: HashMap<String, BuildOutput>,
+        _deps: HashMap<String, BuildOutput>,
     ) -> BuildResult {
         let loc = match task
             .config

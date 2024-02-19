@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::core::*;
 
-pub mod PluginKind {
-    pub const RustLibrary: &str = "rust_library";
-    pub const RustBinary: &str = "rust_binary";
+pub mod plugin_kind {
+    pub const RUST_LIBRARY: &str = "rust_library";
+    pub const RUST_BINARY: &str = "rust_binary";
 }
 
 #[derive(Debug)]
@@ -69,7 +69,7 @@ impl RustPlugin {
             .map(|t| {
                 deps.get(t)
                     .expect("dependencies must be built by now!")
-                    .get(BuildOutputKind::TransitiveProducts)
+                    .get(build_output_kind::TRANSITIVE_PRODUCTS)
                     .iter()
                     .filter_map(move |d| {
                         let mut components = d.splitn(2, ':');
@@ -105,7 +105,7 @@ impl RustPlugin {
             .flatten();
 
         let features = config
-            .get(ConfigExtraKeys::Features)
+            .get(config_extra_keys::FEATURES)
             .iter()
             .map(|s| vec!["--cfg".to_string(), format!("feature=\"{s}\"")].into_iter())
             .flatten();
@@ -144,7 +144,7 @@ impl RustPlugin {
             .collect();
 
         let mut extras = HashMap::new();
-        extras.insert(BuildOutputKind::TransitiveProducts, tdeps);
+        extras.insert(build_output_kind::TRANSITIVE_PRODUCTS, tdeps);
 
         BuildResult::Success(BuildOutput {
             outputs: vec![std::path::PathBuf::from(
@@ -197,7 +197,7 @@ impl RustPlugin {
             .map(|t| {
                 deps.get(t)
                     .expect("dependencies must be built by now!")
-                    .get(BuildOutputKind::TransitiveProducts)
+                    .get(build_output_kind::TRANSITIVE_PRODUCTS)
                     .iter()
                     .filter_map(move |d| {
                         let mut components = d.splitn(2, ':');
@@ -230,7 +230,7 @@ impl RustPlugin {
             .flatten();
 
         let features = config
-            .get(ConfigExtraKeys::Features)
+            .get(config_extra_keys::FEATURES)
             .iter()
             .map(|s| vec!["--cfg".to_string(), format!("'feature=\"{s}\"'")].into_iter())
             .flatten();
@@ -288,9 +288,9 @@ impl BuildPlugin for RustPlugin {
         let name = rust_name(&task.target);
 
         let config = task.config.expect("config must be specified by now");
-        if config.kind == PluginKind::RustLibrary {
+        if config.kind == plugin_kind::RUST_LIBRARY {
             self.build_library(&context, &name, config, deps)
-        } else if config.kind == PluginKind::RustBinary {
+        } else if config.kind == plugin_kind::RUST_BINARY {
             self.build_binary(&context, &name, config, deps)
         } else {
             BuildResult::Failure(format!("unsupported target kind: {:?}", config.kind))

@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use sha2::Digest;
 
 use crate::core::*;
-use crate::plugins::PluginKind;
 
 #[derive(Debug)]
 pub struct Executor {
@@ -139,7 +138,7 @@ impl Executor {
                         .filter(|id| graph.tasks[**id].status() == TaskStatus::Done)
                         .count();
 
-                    let mut t = &mut graph.tasks[task.id];
+                    let t = &mut graph.tasks[task.id];
                     t.dependencies = deps;
                     t.dependencies_ready = dependencies_ready;
 
@@ -359,6 +358,8 @@ mod tests {
     use super::*;
     use crate::cargo::CargoResolver;
 
+    use crate::plugins::plugin_kind;
+
     #[test]
     fn test_execution() {
         let mut e = Executor::new();
@@ -371,20 +372,22 @@ mod tests {
                 "//:lhello",
                 Ok(Config {
                     build_plugin: "@rust_plugin".to_string(),
-                    sources: vec!["/tmp/lhello.rs".to_string()],
+                    sources: vec!["/Users/colinwm/Documents/code/cbs/data/lhello.rs".to_string()],
                     build_dependencies: vec!["@rust_compiler".to_string()],
-                    kind: PluginKind::RustLibrary.to_string(),
+                    kind: plugin_kind::RUST_LIBRARY.to_string(),
                     ..Default::default()
                 }),
             ),
             (
-                "//:my_program",
+                "//:hello_world",
                 Ok(Config {
                     build_plugin: "@rust_plugin".to_string(),
-                    sources: vec!["/tmp/hello_world.rs".to_string()],
+                    sources: vec![
+                        "/Users/colinwm/Documents/code/cbs/data/hello_world.rs".to_string()
+                    ],
                     dependencies: vec!["//:lhello".to_string()],
                     build_dependencies: vec!["@rust_compiler".to_string()],
-                    kind: PluginKind::RustBinary.to_string(),
+                    kind: plugin_kind::RUST_BINARY.to_string(),
                     ..Default::default()
                 }),
             ),
@@ -392,7 +395,9 @@ mod tests {
                 "@rust_plugin",
                 Ok(Config {
                     build_plugin: "@filesystem".to_string(),
-                    location: Some("/tmp/rust.cdylib".to_string()),
+                    location: Some(
+                        "/Users/colinwm/Documents/code/cbs/data/rust.cdylib".to_string(),
+                    ),
                     ..Default::default()
                 }),
             ),
@@ -406,12 +411,14 @@ mod tests {
             ),
         ])));
 
-        let id = e.add_task("//:my_program", None);
+        let id = e.add_task("//:hello_world", None);
         let result = e.run(&[id]);
         assert_eq!(
             result,
             BuildResult::Success(BuildOutput {
-                outputs: vec![std::path::PathBuf::from("/tmp/a.out")],
+                outputs: vec![std::path::PathBuf::from(
+                    "/tmp/cache/build/___hello_world-6ebb3cba5d8c8cf3/hello_world"
+                )],
                 ..Default::default()
             })
         );
@@ -474,10 +481,10 @@ mod tests {
                 "//:dice_roll",
                 Ok(Config {
                     build_plugin: "@rust_plugin".to_string(),
-                    sources: vec!["/tmp/dice_roll.rs".to_string()],
+                    sources: vec!["/Users/colinwm/Documents/code/cbs/data/dice_roll.rs".to_string()],
                     dependencies: vec!["cargo://rand".to_string()],
                     build_dependencies: vec!["@rust_compiler".to_string()],
-                    kind: PluginKind::RustBinary.to_string(),
+                    kind: plugin_kind::RUST_BINARY.to_string(),
                     ..Default::default()
                 }),
             ),
