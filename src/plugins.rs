@@ -215,7 +215,7 @@ impl RustPlugin {
             rustc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ) {
             Ok(o) => o,
-            Err(e) => return BuildResult::Failure(format!("failed to invoke compiler: {e:?}")),
+            Err(e) => return BuildResult::Failure(format!("failed to invoke compiler:\n{e}")),
         };
 
         let tdeps = transitive_deps
@@ -372,7 +372,7 @@ impl RustPlugin {
             rustc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         ) {
             Ok(o) => o,
-            Err(e) => return BuildResult::Failure(format!("failed to invoke compiler: {e:?}")),
+            Err(e) => return BuildResult::Failure(format!("failed to invoke compiler:\n{e}")),
         };
 
         BuildResult::Success(BuildOutput {

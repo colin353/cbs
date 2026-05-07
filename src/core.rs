@@ -266,12 +266,12 @@ impl Task {
     }
 }
 
-pub trait ResolverPlugin: std::fmt::Debug {
+pub trait ResolverPlugin: std::fmt::Debug + Send + Sync {
     fn can_resolve(&self, target: &str) -> bool;
     fn resolve(&self, context: Context, target: &str) -> std::io::Result<Config>;
 }
 
-pub trait DependencyPlannerPlugin: std::fmt::Debug {
+pub trait DependencyPlannerPlugin: std::fmt::Debug + Send + Sync {
     fn ecosystem(&self) -> &str;
 
     fn can_plan_target(&self, target: &str) -> bool {
@@ -285,7 +285,7 @@ pub trait DependencyPlannerPlugin: std::fmt::Debug {
     ) -> std::io::Result<DependencyPlan>;
 }
 
-pub trait BuildPlugin: std::fmt::Debug {
+pub trait BuildPlugin: std::fmt::Debug + Send + Sync {
     fn build(
         &self,
         context: Context,

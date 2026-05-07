@@ -77,7 +77,6 @@ impl Context {
         let target = match self.target.as_ref() {
             Some(t) => t,
             None => {
-                println!("{}", message.into());
                 return;
             }
         };

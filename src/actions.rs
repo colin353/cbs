@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use std::io::Write;
+use std::path::Path;
 use tokio::runtime::Runtime;
 
 use crate::core::{BuildActions, Context};
@@ -95,14 +96,31 @@ impl BuildActions {
             cmd_debug.push_str(arg.as_ref());
             c.arg(arg.as_ref());
         }
-        context.log(format!("run_command: {cmd_debug}"));
+        eprintln!(
+            "[cbs] action {}: {}",
+            context.target.as_deref().unwrap_or("workspace"),
+            command_name(&cmd_debug)
+        );
+        context.log(format!("command: {cmd_debug}"));
 
         let out = c.output()?;
         if !out.status.success() {
-            context.log(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 output>"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stdout.trim().is_empty() {
+                context.log(format!("stdout:\n{}", stdout.trim_end()));
+            }
+            if !stderr.trim().is_empty() {
+                context.log(format!("stderr:\n{}", stderr.trim_end()));
+            }
+            let mut message = format!("command exited with {}\ncommand: {cmd_debug}", out.status);
+            if context.target.is_none() && !stderr.trim().is_empty() {
+                message.push_str("\nstderr:\n");
+                message.push_str(stderr.trim_end());
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("command failed: {cmd_debug}",),
+                message,
             ));
         }
 
@@ -134,4 +152,13 @@ impl BuildActions {
 
         handle.block_on(download(url, dest))
     }
+}
+
+fn command_name(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|bin| Path::new(bin).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
 }

@@ -225,6 +225,12 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
             .join("cargo")
             .join(plan_id(context.hash, requirements));
         std::fs::create_dir_all(workdir.join("src"))?;
+        let plan_cache = workdir.join("plan.json");
+        if let Some(plan) = read_cached_dependency_plan(&plan_cache)? {
+            eprintln!("[cbs] cache hit cargo plan");
+            return Ok(plan);
+        }
+
         let manifest_path = workdir.join("Cargo.toml");
         std::fs::write(&manifest_path, manifest)?;
         std::fs::write(workdir.join("src").join("lib.rs"), "")?;
@@ -244,8 +250,74 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
             .actions
             .run_process(&context, "cargo", &args)
             .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
-        metadata_to_dependency_plan(&context, requirements, &output)
+        let plan = metadata_to_dependency_plan(&context, requirements, &output)?;
+        write_cached_dependency_plan(&plan_cache, &plan)?;
+        Ok(plan)
     }
+}
+
+fn read_cached_dependency_plan(path: &std::path::Path) -> std::io::Result<Option<DependencyPlan>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(DependencyPlan {
+        lockfile: json_string_map(value.get("lockfile"))?,
+        locked_dependencies: json_nested_string_map(value.get("locked_dependencies"))?,
+    }))
+}
+
+fn write_cached_dependency_plan(
+    path: &std::path::Path,
+    plan: &DependencyPlan,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::json!({
+            "lockfile": plan.lockfile,
+            "locked_dependencies": plan.locked_dependencies,
+        })
+        .to_string(),
+    )?;
+    std::fs::rename(tmp, path)
+}
+
+fn json_string_map(value: Option<&serde_json::Value>) -> std::io::Result<HashMap<String, String>> {
+    let Some(object) = value.and_then(|value| value.as_object()) else {
+        return Ok(HashMap::new());
+    };
+    object
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                key.clone(),
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("cache value for {key} must be a string"),
+                        )
+                    })?
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn json_nested_string_map(
+    value: Option<&serde_json::Value>,
+) -> std::io::Result<HashMap<String, HashMap<String, String>>> {
+    let Some(object) = value.and_then(|value| value.as_object()) else {
+        return Ok(HashMap::new());
+    };
+    object
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json_string_map(Some(value))?)))
+        .collect()
 }
 
 fn plan_id(context_hash: u64, requirements: &[ExternalRequirement]) -> String {

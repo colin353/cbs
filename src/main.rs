@@ -27,6 +27,7 @@ fn run() -> std::io::Result<()> {
             if args.next().is_some() {
                 return Err(usage_error());
             }
+            eprintln!("[cbs] build requested: {target}");
             match workspace::build_from_current_workspace(&target)? {
                 core::BuildResult::Success(output) => {
                     for output in output.outputs {
@@ -49,6 +50,7 @@ fn run() -> std::io::Result<()> {
                 Some(arg) => std::iter::once(arg.to_string()).chain(args).collect(),
                 None => Vec::new(),
             };
+            eprintln!("[cbs] run requested: {target}");
             match workspace::build_from_current_workspace(&target)? {
                 core::BuildResult::Success(output) => {
                     let executable = output.outputs.first().ok_or_else(|| {
@@ -57,6 +59,7 @@ fn run() -> std::io::Result<()> {
                             format!("{target} did not produce an executable output"),
                         )
                     })?;
+                    eprintln!("[cbs] execute {}", executable.display());
                     let status = std::process::Command::new(executable)
                         .args(run_args)
                         .status()?;

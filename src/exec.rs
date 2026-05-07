@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use sha2::Digest;
 
@@ -9,6 +9,7 @@ use crate::core::*;
 pub struct Executor {
     context: Context,
     tasks: Mutex<TaskGraph>,
+    task_events: Condvar,
 
     resolvers: Vec<Box<dyn ResolverPlugin>>,
     dependency_planners: Vec<Box<dyn DependencyPlannerPlugin>>,
@@ -22,6 +23,12 @@ pub struct TaskGraph {
     rdeps: Vec<Vec<usize>>,
 }
 
+enum WorkItem {
+    Task(Task),
+    Done,
+    Deadlocked(String),
+}
+
 impl Executor {
     pub fn new() -> Self {
         let mut context = Context::new(std::path::PathBuf::from("/tmp/cache"), std::iter::empty());
@@ -30,6 +37,7 @@ impl Executor {
         Self {
             context,
             tasks: Mutex::new(TaskGraph::new()),
+            task_events: Condvar::new(),
 
             resolvers: Vec::new(),
             dependency_planners: Vec::new(),
@@ -47,6 +55,7 @@ impl Executor {
         Self {
             context,
             tasks: Mutex::new(TaskGraph::new()),
+            task_events: Condvar::new(),
 
             resolvers: Vec::new(),
             dependency_planners: Vec::new(),
@@ -82,39 +91,43 @@ impl Executor {
         id
     }
 
-    pub fn next_task(&self) -> Option<Task> {
-        let mut graph = self.tasks.lock().unwrap();
-        for task in &mut graph.tasks {
-            if task.available {
-                match task.status() {
-                    TaskStatus::Resolving | TaskStatus::Building => {
-                        // Mark the task as unavailable
-                        task.available = false;
-                        return Some(task.clone());
-                    }
-                    TaskStatus::Blocked | TaskStatus::Done => continue,
-                }
-            }
+    pub fn run(&mut self, roots: &[usize]) -> BuildResult {
+        eprintln!("[cbs] planning external dependencies");
+        if let Err(e) = self.plan_external_dependencies() {
+            return BuildResult::Failure(format!("dependency planning failed:\n{e}"));
         }
-        None
+        if self.all_tasks_done() {
+            return self.collect_results(roots);
+        }
+
+        let workers = self.worker_count();
+        eprintln!("[cbs] building graph with {workers} worker(s)");
+        if let Some(error) = self.run_workers(workers) {
+            return BuildResult::Failure(error);
+        }
+
+        self.collect_results(roots)
     }
 
-    pub fn run(&mut self, roots: &[usize]) -> BuildResult {
-        if let Err(e) = self.plan_external_dependencies() {
-            return BuildResult::Failure(format!("dependency planning failed: {e:#?}"));
-        }
+    fn all_tasks_done(&self) -> bool {
+        self.tasks
+            .lock()
+            .unwrap()
+            .tasks
+            .iter()
+            .all(|task| task.status() == TaskStatus::Done)
+    }
 
-        while let Some(task) = self.next_task() {
-            match task.status() {
-                TaskStatus::Resolving => self.resolve(task),
-                TaskStatus::Building => self.build(task),
-                TaskStatus::Blocked | TaskStatus::Done => {
-                    unreachable!("cannot acquire a blocked or done task!")
-                }
-            }
-        }
+    fn any_tasks_failed(&self) -> bool {
+        self.tasks
+            .lock()
+            .unwrap()
+            .tasks
+            .iter()
+            .any(|task| matches!(task.result.as_ref(), Some(BuildResult::Failure(_))))
+    }
 
-        // All tasks must be built by now...
+    fn collect_results(&self, roots: &[usize]) -> BuildResult {
         let graph = self.tasks.lock().unwrap();
         for task in &graph.tasks {
             if task.status() != TaskStatus::Done {
@@ -142,9 +155,100 @@ impl Executor {
         }))
     }
 
+    fn worker_count(&self) -> usize {
+        std::env::var("CBS_JOBS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|jobs| *jobs > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|parallelism| parallelism.get())
+                    .unwrap_or(1)
+            })
+    }
+
+    fn run_workers(&self, workers: usize) -> Option<String> {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..workers {
+                handles.push(scope.spawn(|| self.worker_loop()));
+            }
+
+            handles.into_iter().find_map(|handle| match handle.join() {
+                Ok(None) => None,
+                Ok(Some(error)) => Some(error),
+                Err(_) => Some("build worker panicked".to_string()),
+            })
+        })
+    }
+
+    fn worker_loop(&self) -> Option<String> {
+        loop {
+            match self.next_parallel_task() {
+                WorkItem::Task(task) => match task.status() {
+                    TaskStatus::Resolving => self.resolve(task),
+                    TaskStatus::Building => self.build(task),
+                    TaskStatus::Blocked | TaskStatus::Done => {
+                        unreachable!("cannot acquire a blocked or done task!")
+                    }
+                },
+                WorkItem::Done => return None,
+                WorkItem::Deadlocked(reason) => return Some(reason),
+            }
+        }
+    }
+
+    fn next_parallel_task(&self) -> WorkItem {
+        let mut graph = self.tasks.lock().unwrap();
+        loop {
+            for task in &mut graph.tasks {
+                if task.available {
+                    match task.status() {
+                        TaskStatus::Resolving | TaskStatus::Building => {
+                            task.available = false;
+                            return WorkItem::Task(task.clone());
+                        }
+                        TaskStatus::Blocked | TaskStatus::Done => continue,
+                    }
+                }
+            }
+
+            if graph
+                .tasks
+                .iter()
+                .all(|task| task.status() == TaskStatus::Done)
+            {
+                return WorkItem::Done;
+            }
+
+            let running = graph.tasks.iter().any(|task| {
+                !task.available
+                    && matches!(task.status(), TaskStatus::Resolving | TaskStatus::Building)
+            });
+            if !running {
+                let waiting: Vec<_> = graph
+                    .tasks
+                    .iter()
+                    .filter(|task| task.status() != TaskStatus::Done)
+                    .map(|task| task.target.clone())
+                    .collect();
+                self.task_events.notify_all();
+                return WorkItem::Deadlocked(format!(
+                    "build graph deadlocked; waiting on {}",
+                    waiting.join(", ")
+                ));
+            }
+
+            graph = self.task_events.wait(graph).unwrap();
+        }
+    }
+
     fn plan_external_dependencies(&mut self) -> std::io::Result<()> {
         while let Some(task) = self.next_planning_task() {
             self.resolve(task);
+        }
+        if self.any_tasks_failed() {
+            return Ok(());
         }
 
         let mut requirements: HashMap<String, Vec<ExternalRequirement>> = HashMap::new();
@@ -164,12 +268,14 @@ impl Executor {
         }
 
         if requirements.is_empty() {
+            eprintln!("[cbs] no external dependencies to plan");
             return Ok(());
         }
 
         let mut lockfile = self.context.lockfile.as_ref().clone();
         let mut locked_dependencies = self.context.locked_dependencies.as_ref().clone();
         for (ecosystem, reqs) in requirements {
+            eprintln!("[cbs] plan {ecosystem}: {} root requirement(s)", reqs.len());
             let planner = self
                 .dependency_planners
                 .iter()
@@ -181,6 +287,11 @@ impl Executor {
                     )
                 })?;
             let plan = planner.plan(self.context.clone(), &reqs)?;
+            eprintln!(
+                "[cbs] planned {ecosystem}: {} lock entry(s), {} dependency edge set(s)",
+                plan.lockfile.len(),
+                plan.locked_dependencies.len()
+            );
             lockfile.extend(plan.lockfile);
             locked_dependencies.extend(plan.locked_dependencies);
         }
@@ -215,6 +326,7 @@ impl Executor {
     }
 
     pub fn resolve(&self, task: Task) {
+        eprintln!("[cbs] resolve {}", task.target);
         for resolver in &self.resolvers {
             if !resolver.can_resolve(&task.target) {
                 continue;
@@ -243,11 +355,13 @@ impl Executor {
 
                     t.config = Some(config);
                     t.available = true;
+                    drop(graph);
+                    self.task_events.notify_all();
                 }
                 Err(e) => {
                     self.mark_task_failure(
                         task.id,
-                        BuildResult::Failure(format!("target resolution failed: {e:#?}")),
+                        BuildResult::Failure(format!("target resolution failed:\n{e}")),
                     );
                 }
             }
@@ -328,12 +442,30 @@ impl Executor {
                 .expect("invalid hash size"),
         );
         let hash = config.calculate_hash(self.context.hash, dep_hash);
+        let kind = if config.kind.is_empty() {
+            config.build_plugin.clone()
+        } else {
+            config.kind.clone()
+        };
 
         let _t = task.clone();
         let ctx = self.context.with_task(&_t);
+        if let Some(output) = read_cached_build_output(&ctx) {
+            eprintln!("[cbs] cache hit {}", task.target);
+            self.mark_build_success(task.id, BuildResult::Success(output), hash);
+            return;
+        }
+
+        eprintln!("[cbs] build {} ({kind})", task.target);
         let result = plugin.build(ctx, _t, deps);
         match result {
-            BuildResult::Success { .. } => {
+            BuildResult::Success(ref output) => {
+                if let Err(e) = write_cached_build_output(&self.context.with_task(&task), output) {
+                    eprintln!(
+                        "[cbs] warning: failed to write cache for {}: {e}",
+                        task.target
+                    );
+                }
                 self.mark_build_success(task.id, result, hash);
             }
             BuildResult::Failure(_) => {
@@ -344,7 +476,6 @@ impl Executor {
 
     pub fn mark_task_failure(&self, id: usize, result: BuildResult) {
         {
-            // The task failed, so we can log the reason:
             let graph = self.tasks.lock().unwrap();
             let task = graph.tasks.get(id).unwrap();
             let stage = match task.failure_stage() {
@@ -352,19 +483,22 @@ impl Executor {
                 TaskStatus::Building => "build",
                 _ => "??",
             };
-            println!("\nfailed to {} {}:\n", stage, task.target);
-            if let Some(msgs) = self.context.logs.read().unwrap().get(&task.target) {
-                for msg in msgs.lock().unwrap().iter() {
-                    println!("{}", msg);
-                }
-            }
-
+            eprintln!("\n[cbs] error: {stage} failed");
+            eprintln!("  target: {}", task.target);
             if let BuildResult::Failure(ref msg) = result {
-                println!("{msg}");
+                eprintln!("  reason:");
+                print_indented(msg, 4);
+            }
+            if let Some(msgs) = self.context.logs.read().unwrap().get(&task.target) {
+                eprintln!("  logs:");
+                for msg in msgs.lock().unwrap().iter() {
+                    print_indented(msg, 4);
+                }
             }
         }
 
         self.tasks.lock().unwrap().mark_task_failure(id, id, result);
+        self.task_events.notify_all();
     }
 
     pub fn print_all_logs(&self) {
@@ -381,7 +515,125 @@ impl Executor {
             .lock()
             .unwrap()
             .mark_build_success(id, result, hash);
+        self.task_events.notify_all();
     }
+}
+
+fn print_indented(message: &str, spaces: usize) {
+    let indent = " ".repeat(spaces);
+    for line in message.lines() {
+        eprintln!("{indent}{line}");
+    }
+}
+
+fn read_cached_build_output(context: &Context) -> Option<BuildOutput> {
+    let path = build_output_cache_file(context);
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let output = parse_cached_build_output(&value).ok()?;
+    if build_output_paths_exist(&output) {
+        Some(output)
+    } else {
+        None
+    }
+}
+
+fn write_cached_build_output(context: &Context, output: &BuildOutput) -> std::io::Result<()> {
+    let path = build_output_cache_file(context);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::create_dir_all(path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cache path has no parent: {}", path.display()),
+        )
+    })?)?;
+    std::fs::write(
+        &tmp,
+        serde_json::json!({
+            "outputs": output.outputs.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "extras": output.extras.iter().map(|(key, values)| (key.to_string(), values.clone())).collect::<HashMap<_, _>>(),
+        })
+        .to_string(),
+    )?;
+    std::fs::rename(tmp, path)
+}
+
+fn build_output_cache_file(context: &Context) -> std::path::PathBuf {
+    context.working_directory().join("build-output.json")
+}
+
+fn parse_cached_build_output(value: &serde_json::Value) -> std::io::Result<BuildOutput> {
+    let outputs = value
+        .get("outputs")
+        .and_then(|outputs| outputs.as_array())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "cache missing outputs")
+        })?
+        .iter()
+        .map(|output| {
+            output
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "cached output path must be a string",
+                    )
+                })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let extras = value
+        .get("extras")
+        .and_then(|extras| extras.as_object())
+        .map(|extras| {
+            extras
+                .iter()
+                .map(|(key, values)| {
+                    let key = key.parse::<u32>().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("cached extra key must be a u32: {e}"),
+                        )
+                    })?;
+                    let values = values
+                        .as_array()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "cached extra values must be an array",
+                            )
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(|value| value.to_string())
+                                .ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "cached extra value must be a string",
+                                    )
+                                })
+                        })
+                        .collect::<std::io::Result<Vec<_>>>()?;
+                    Ok((key, values))
+                })
+                .collect::<std::io::Result<HashMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(BuildOutput { outputs, extras })
+}
+
+fn build_output_paths_exist(output: &BuildOutput) -> bool {
+    output.outputs.iter().all(|path| path.exists())
+        && output.extras.values().flatten().all(|value| {
+            value
+                .split_once(':')
+                .map(|(_, path)| std::path::Path::new(path).exists())
+                .unwrap_or(true)
+        })
 }
 
 impl TaskGraph {
