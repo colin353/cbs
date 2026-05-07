@@ -495,12 +495,197 @@ mod tests {
 
         // e.print_all_logs();
 
+        let BuildResult::Success(output) = result else {
+            panic!("cargo build failed");
+        };
         assert_eq!(
-            result,
-            BuildResult::Success(BuildOutput {
-                outputs: vec![std::path::PathBuf::from("/tmp/a.out")],
-                ..Default::default()
-            })
+            output.outputs[0].file_name().and_then(|name| name.to_str()),
+            Some("dice_roll")
+        );
+    }
+
+    #[test]
+    fn test_cargo_libc_build() {
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
+        e.builders
+            .lock()
+            .unwrap()
+            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
+
+        e.context.lockfile = Arc::new(
+            vec![("cargo://libc".to_string(), "0.2.151".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        e.resolvers.push(Box::new(CargoResolver::new()));
+        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
+            (
+                "@rust_compiler",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/Users/colinwm/.cargo/bin/rustc".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "@rust_plugin",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/tmp/rust.cdylib".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        ])));
+
+        let id = e.add_task("cargo://libc", None);
+        let result = e.run(&[id]);
+
+        let BuildResult::Success(output) = result else {
+            panic!("libc build failed");
+        };
+        assert_eq!(
+            output.outputs[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("liblibc-")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cargo_hyper_build() {
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
+        e.builders
+            .lock()
+            .unwrap()
+            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
+
+        let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
+        lockfile.extend(
+            [
+                ("cargo://bytes@0.5.6", "0.5.6,default,std"),
+                ("cargo://bytes@1.5.0", "1.5.0,default,std"),
+                ("cargo://cfg-if@0.1.10", "0.1.10"),
+                ("cargo://cfg-if@1.0.0", "1.0.0"),
+                ("cargo://fnv", "1.0.7,default,std"),
+                ("cargo://futures-channel", "0.3.30,alloc,default,futures-sink,sink,std"),
+                ("cargo://futures-core", "0.3.30,alloc,default,std"),
+                ("cargo://futures-io", "0.3.30,std"),
+                ("cargo://futures-macro", "0.3.30"),
+                ("cargo://futures-sink", "0.3.30,alloc,default,std"),
+                ("cargo://futures-task", "0.3.30,alloc,std"),
+                (
+                    "cargo://futures-util",
+                    "0.3.30,alloc,async-await,async-await-macro,channel,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,sink,slab,std",
+                ),
+                ("cargo://h2", "0.2.7"),
+                ("cargo://hashbrown@0.12.3", "0.12.3,raw"),
+                ("cargo://http", "0.2.11"),
+                ("cargo://http-body", "0.3.1"),
+                ("cargo://httparse", "1.8.0,default,std"),
+                ("cargo://httpdate", "0.3.2"),
+                ("cargo://hyper", "0.13.10,stream"),
+                ("cargo://indexmap@1.9.3", "1.9.3,std"),
+                ("cargo://iovec", "0.1.4"),
+                ("cargo://itoa@0.4.8", "0.4.8,default,std"),
+                ("cargo://itoa@1.0.10", "1.0.10"),
+                ("cargo://lazy_static", "1.4.0"),
+                ("cargo://libc", "0.2.151,align,default,extra_traits,std"),
+                ("cargo://log", "0.4.20"),
+                ("cargo://memchr", "2.6.4,alloc,default,std"),
+                ("cargo://mio", "0.6.23,default,with-deprecated"),
+                ("cargo://mio-uds", "0.6.8"),
+                ("cargo://net2", "0.2.39,default,duration"),
+                ("cargo://num_cpus", "1.16.0"),
+                ("cargo://once_cell", "1.19.0,alloc,default,race,std"),
+                ("cargo://pin-project", "1.1.3"),
+                ("cargo://pin-project-internal", "1.1.3"),
+                ("cargo://pin-project-lite@0.1.12", "0.1.12"),
+                ("cargo://pin-project-lite@0.2.13", "0.2.13"),
+                ("cargo://pin-utils", "0.1.0"),
+                ("cargo://proc-macro2", "1.0.71,default,proc-macro"),
+                ("cargo://quote", "1.0.33,default,proc-macro"),
+                ("cargo://signal-hook-registry", "1.4.1"),
+                ("cargo://slab", "0.4.9,default,std"),
+                ("cargo://socket2", "0.3.19"),
+                (
+                    "cargo://syn@1.0.109",
+                    "1.0.109,clone-impls,default,derive,full,parsing,printing,proc-macro,quote",
+                ),
+                (
+                    "cargo://syn@2.0.43",
+                    "2.0.43,clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut",
+                ),
+                (
+                    "cargo://tokio",
+                    "0.2.25,blocking,default,dns,fnv,fs,full,futures-core,io-driver,io-std,io-util,iovec,lazy_static,libc,macros,memchr,mio,mio-uds,net,num_cpus,rt-core,rt-threaded,rt-util,signal,signal-hook-registry,slab,stream,sync,tcp,time,tokio-macros,udp,uds",
+                ),
+                ("cargo://tokio-macros", "0.2.6"),
+                ("cargo://tokio-util", "0.3.1,codec,default"),
+                ("cargo://tower-service", "0.3.2"),
+                ("cargo://tracing", "0.1.40,log,std"),
+                ("cargo://tracing-core", "0.1.32,once_cell,std"),
+                ("cargo://tracing-futures", "0.2.5,pin-project,std-future"),
+                ("cargo://try-lock", "0.2.5"),
+                ("cargo://unicode-ident", "1.0.12"),
+                ("cargo://want", "0.3.1"),
+            ]
+            .into_iter()
+            .map(|(target, lockstring)| (target.to_string(), lockstring.to_string())),
+        );
+        e.context.lockfile = Arc::new(lockfile);
+
+        e.resolvers.push(Box::new(resolver));
+        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
+            (
+                "@rust_compiler",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/Users/colinwm/.cargo/bin/rustc".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "@rust_plugin",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/tmp/rust.cdylib".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "//:hyper_headers",
+                Ok(Config {
+                    build_plugin: "@rust_plugin".to_string(),
+                    sources: vec![
+                        "/Users/colinwm/Documents/code/cbs/data/hyper_headers.rs".to_string()
+                    ],
+                    dependencies: vec!["cargo://hyper".to_string()],
+                    build_dependencies: vec!["@rust_compiler".to_string()],
+                    kind: plugin_kind::RUST_BINARY.to_string(),
+                    ..Default::default()
+                }),
+            ),
+        ])));
+
+        let id = e.add_task("//:hyper_headers", None);
+        let result = e.run(&[id]);
+
+        let BuildResult::Success(output) = result else {
+            panic!("hyper build failed");
+        };
+        assert_eq!(
+            output.outputs[0].file_name().and_then(|name| name.to_str()),
+            Some("hyper_headers")
         );
     }
 }

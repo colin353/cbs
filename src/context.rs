@@ -97,10 +97,11 @@ impl Context {
                 let v = self
                     .get_locked_version(&t)
                     .unwrap_or_else(|_| String::new());
-                self.cache_dir
-                    .join("resolve")
-                    .join("scratch")
-                    .join(format!("{}-{v}", to_dir(t)))
+                self.cache_dir.join("resolve").join("scratch").join(format!(
+                    "{}-{}",
+                    to_dir(t),
+                    version_dir(&v)
+                ))
             }
             (Some(t), Some(h)) => self
                 .cache_dir
@@ -120,7 +121,7 @@ impl Context {
                     .unwrap_or_else(|_| String::new());
                 self.cache_dir
                     .join("resolve")
-                    .join(format!("{}-{v}", to_dir(t)))
+                    .join(format!("{}-{}", to_dir(t), version_dir(&v)))
             }
             (Some(t), Some(h)) => self
                 .cache_dir
@@ -134,4 +135,19 @@ impl Context {
 
 fn to_dir(name: &str) -> String {
     name.replace(&[':', '/', '@'], "_")
+}
+
+fn version_dir(version: &str) -> String {
+    if version.len() <= 64 {
+        return version.to_string();
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(version.as_bytes());
+    let hash = u64::from_be_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("invalid hash size"),
+    );
+    format!("{hash:x}")
 }

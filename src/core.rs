@@ -98,6 +98,12 @@ pub struct Config {
 
 pub mod config_extra_keys {
     pub const FEATURES: u32 = 0;
+    pub const CRATE_NAME: u32 = 1;
+    pub const CRATE_TYPE: u32 = 2;
+    pub const EDITION: u32 = 3;
+    pub const ROOT_SOURCE: u32 = 4;
+    pub const DEPENDENCY_ALIASES: u32 = 5;
+    pub const RUSTC_CFGS: u32 = 6;
 }
 
 impl Config {
