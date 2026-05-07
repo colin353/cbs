@@ -135,6 +135,7 @@ pub mod config_extra_keys {
     pub const RUSTC_CFGS: u32 = 6;
     pub const CRATE_ROOT: u32 = 7;
     pub const NATIVE_STATIC_LIBS: u32 = 8;
+    pub const RUSTC_ENV: u32 = 9;
 }
 
 impl Config {
@@ -191,6 +192,15 @@ impl Config {
                     break;
                 }
                 hasher.update(&buffer[0..count]);
+            }
+        }
+        let mut extras: Vec<_> = self.extras.iter().collect();
+        extras.sort_by_key(|(k, _)| **k);
+        for (key, values) in extras {
+            hasher.update(key.to_be_bytes());
+            for value in values {
+                hasher.update(value.as_bytes());
+                hasher.update([0]);
             }
         }
         self.hash = u64::from_be_bytes(

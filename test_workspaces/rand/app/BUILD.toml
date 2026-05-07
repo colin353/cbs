@@ -1,0 +1,6 @@
+[[rust_binary]]
+name = "rand_example"
+srcs = ["main.rs"]
+cargo_deps = [
+  { package = "rand", version = "=0.8.5", features = ["std", "std_rng"] },
+]

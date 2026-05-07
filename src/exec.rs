@@ -40,6 +40,10 @@ impl Executor {
     pub fn with_config<T: IntoIterator<Item = (BuildConfigKey, String)>>(config: T) -> Self {
         let mut context = Context::new(std::path::PathBuf::from("/tmp/cache"), config);
         context.calculate_hash();
+        Self::with_context(context)
+    }
+
+    pub fn with_context(context: Context) -> Self {
         Self {
             context,
             tasks: Mutex::new(TaskGraph::new()),
@@ -48,6 +52,22 @@ impl Executor {
             dependency_planners: Vec::new(),
             builders: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn add_resolver_plugin(&mut self, resolver: Box<dyn ResolverPlugin>) {
+        self.resolvers.push(resolver);
+    }
+
+    pub fn add_dependency_planner_plugin(&mut self, planner: Box<dyn DependencyPlannerPlugin>) {
+        self.dependency_planners.push(planner);
+    }
+
+    pub fn add_builder_plugin<T: Into<String>>(
+        &mut self,
+        target: T,
+        builder: Arc<dyn BuildPlugin>,
+    ) {
+        self.builders.lock().unwrap().insert(target.into(), builder);
     }
 
     pub fn add_task<T: Into<String>>(&self, target: T, rdep: Option<usize>) -> usize {

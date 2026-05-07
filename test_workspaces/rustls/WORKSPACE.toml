@@ -1,0 +1,13 @@
+[workspace]
+cache_dir = "/tmp/cbs-test-workspaces/rustls"
+
+[toolchain.rust]
+rustc = "rustc"
+
+[target]
+family = "unix"
+os = "macos"
+env = ""
+arch = "aarch64"
+vendor = "apple"
+endian = "little"

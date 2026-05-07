@@ -1,0 +1,6 @@
+[[rust_binary]]
+name = "hyper_headers"
+srcs = ["main.rs"]
+cargo_deps = [
+  { package = "hyper", version = "=0.13.10", default_features = false, features = ["stream"] },
+]

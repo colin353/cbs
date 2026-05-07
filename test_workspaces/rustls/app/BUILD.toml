@@ -1,0 +1,6 @@
+[[rust_binary]]
+name = "rustls_smoke"
+srcs = ["main.rs"]
+cargo_deps = [
+  { package = "rustls", version = "=0.23.31", default_features = false, features = ["std", "ring"] },
+]

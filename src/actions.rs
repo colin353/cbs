@@ -65,9 +65,31 @@ impl BuildActions {
     where
         S: AsRef<str>,
     {
+        self.run_process_with_env(context, bin, args, std::iter::empty::<(&str, &str)>())
+    }
+
+    pub fn run_process_with_env<P: Into<std::path::PathBuf>, S, E, K, V>(
+        &self,
+        context: &Context,
+        bin: P,
+        args: &[S],
+        env: E,
+    ) -> std::io::Result<Vec<u8>>
+    where
+        S: AsRef<str>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         let bin = bin.into();
         let mut cmd_debug = format!("{}", bin.to_string_lossy());
         let mut c = std::process::Command::new(bin);
+        for (key, value) in env {
+            cmd_debug.push(' ');
+            cmd_debug.push_str(key.as_ref());
+            cmd_debug.push_str("=<env>");
+            c.env(key.as_ref(), value.as_ref());
+        }
         for arg in args {
             cmd_debug.push(' ');
             cmd_debug.push_str(arg.as_ref());

@@ -157,12 +157,18 @@ impl RustPlugin {
                 .into_iter()
             })
             .flatten();
+        let transitive_native_link_args = native_link_args_from_products(&transitive_deps);
 
         let extern_crates = libraries
             .clone()
             .into_iter()
             .map(|(name, s)| vec!["--extern".to_string(), format!("{name}={}", s)].into_iter())
             .flatten();
+        let proc_macro_extern = if crate_type == "proc-macro" {
+            vec!["--extern".to_string(), "proc_macro".to_string()]
+        } else {
+            Vec::new()
+        };
 
         let features = config
             .get(config_extra_keys::FEATURES)
@@ -178,8 +184,10 @@ impl RustPlugin {
         let mut args: Vec<String> = Vec::new();
         args.push(root_source);
         args.extend(extern_crates);
+        args.extend(proc_macro_extern);
         args.extend(transitive_libraries);
         args.extend(native_link_args);
+        args.extend(transitive_native_link_args);
         args.extend(features);
         args.extend(rustc_cfgs);
 
@@ -199,10 +207,13 @@ impl RustPlugin {
             "--color=always".to_string(),
         ]);
 
-        match context
-            .actions
-            .run_process(context, compiler, args.as_slice())
-        {
+        let rustc_env = rustc_env(&config);
+        match context.actions.run_process_with_env(
+            context,
+            compiler,
+            args.as_slice(),
+            rustc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ) {
             Ok(o) => o,
             Err(e) => return BuildResult::Failure(format!("failed to invoke compiler: {e:?}")),
         };
@@ -308,6 +319,7 @@ impl RustPlugin {
                 .into_iter()
             })
             .flatten();
+        let transitive_native_link_args = native_link_args_from_products(&transitive_deps);
 
         let extern_crates = libraries
             .clone()
@@ -345,16 +357,20 @@ impl RustPlugin {
         args.push(root_source);
         args.extend(extern_crates);
         args.extend(transitive_libraries);
+        args.extend(transitive_native_link_args);
         args.extend(features);
         args.extend(rustc_cfgs);
         args.extend(["-o".to_string(), out_file.to_string_lossy().to_string()]);
         args.push("--edition=2021".to_string());
         args.push("--color=always".to_string());
 
-        match context
-            .actions
-            .run_process(context, compiler, args.as_slice())
-        {
+        let rustc_env = rustc_env(&config);
+        match context.actions.run_process_with_env(
+            context,
+            compiler,
+            args.as_slice(),
+            rustc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ) {
             Ok(o) => o,
             Err(e) => return BuildResult::Failure(format!("failed to invoke compiler: {e:?}")),
         };
@@ -396,6 +412,37 @@ fn runtime_dependencies(config: &Config) -> Vec<String> {
     deps.sort();
     deps.dedup();
     deps
+}
+
+fn rustc_env(config: &Config) -> Vec<(String, String)> {
+    config
+        .get(config_extra_keys::RUSTC_ENV)
+        .iter()
+        .filter_map(|encoded| {
+            let (key, value) = encoded.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn native_link_args_from_products(products: &[(String, String)]) -> Vec<String> {
+    products
+        .iter()
+        .filter_map(|(name, path)| {
+            Some((
+                name.strip_prefix("native_")?,
+                std::path::Path::new(path).parent()?.to_string_lossy(),
+            ))
+        })
+        .flat_map(|(name, parent)| {
+            vec![
+                "-L".to_string(),
+                format!("native={parent}"),
+                "-l".to_string(),
+                format!("static={name}"),
+            ]
+        })
+        .collect()
 }
 
 struct NativeStaticLib {

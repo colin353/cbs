@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use sha2::Digest;
+
 use crate::cargo_recipes;
 use crate::core::{
     config_extra_keys, BuildConfigKey, Config, Context, DependencyPlan, DependencyPlannerPlugin,
@@ -217,7 +219,11 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
         }
 
         let manifest = synthetic_manifest(requirements)?;
-        let workdir = context.cache_dir.join("dependency-plans").join("cargo");
+        let workdir = context
+            .cache_dir
+            .join("dependency-plans")
+            .join("cargo")
+            .join(plan_id(context.hash, requirements));
         std::fs::create_dir_all(workdir.join("src"))?;
         let manifest_path = workdir.join("Cargo.toml");
         std::fs::write(&manifest_path, manifest)?;
@@ -240,6 +246,36 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
             .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
         metadata_to_dependency_plan(&context, requirements, &output)
     }
+}
+
+fn plan_id(context_hash: u64, requirements: &[ExternalRequirement]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(context_hash.to_be_bytes());
+    for req in requirements {
+        hasher.update(req.ecosystem.as_bytes());
+        hasher.update([0]);
+        hasher.update(req.package.as_bytes());
+        hasher.update([0]);
+        hasher.update(req.version.as_bytes());
+        hasher.update([0]);
+        hasher.update([req.default_features as u8]);
+        for feature in &req.features {
+            hasher.update(feature.as_bytes());
+            hasher.update([0]);
+        }
+        if let Some(target) = &req.target {
+            hasher.update(target.as_bytes());
+        }
+        hasher.update([0xff]);
+    }
+    format!(
+        "{:x}",
+        u64::from_be_bytes(
+            hasher.finalize()[..8]
+                .try_into()
+                .expect("invalid hash size")
+        )
+    )
 }
 
 #[derive(Debug)]
@@ -415,9 +451,7 @@ fn metadata_to_dependency_plan(
     }
 
     for req in requirements {
-        let Some(target) = req.target.as_ref() else {
-            continue;
-        };
+        let target = req.target();
         let Some(info) = package_infos
             .values()
             .find(|info| info.id != root_id && info.name == req.package)
@@ -429,7 +463,7 @@ fn metadata_to_dependency_plan(
             lockfile.insert(target.clone(), lockstring);
         }
         if let Some(deps) = locked_dependencies.get(&resolved_target).cloned() {
-            locked_dependencies.insert(target.clone(), deps);
+            locked_dependencies.insert(target, deps);
         }
     }
 
@@ -571,6 +605,7 @@ struct CargoToml {
     root_source: std::path::PathBuf,
     features: Vec<String>,
     has_build_script: bool,
+    rustc_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -628,6 +663,10 @@ fn parse_cargo_toml(
                 "Cargo.toml package missing name",
             )
         })?;
+    let package_version = package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.0.0");
     let edition = package
         .get("edition")
         .and_then(|v| v.as_str())
@@ -767,7 +806,110 @@ fn parse_cargo_toml(
         root_source,
         features,
         has_build_script,
+        rustc_env: cargo_rustc_env(package, manifest_dir, package_name, package_version),
     })
+}
+
+fn cargo_rustc_env(
+    package: &toml::map::Map<String, toml::Value>,
+    manifest_dir: &std::path::Path,
+    package_name: &str,
+    package_version: &str,
+) -> Vec<String> {
+    let (version_core, version_pre) = package_version
+        .split_once('-')
+        .map(|(core, pre)| (core, pre))
+        .unwrap_or((package_version, ""));
+    let mut version_parts = version_core.split('.');
+    let version_major = version_parts.next().unwrap_or("0");
+    let version_minor = version_parts.next().unwrap_or("0");
+    let version_patch = version_parts.next().unwrap_or("0");
+
+    let mut env = vec![
+        (
+            "CARGO_MANIFEST_DIR".to_string(),
+            manifest_dir.display().to_string(),
+        ),
+        ("CARGO_PKG_NAME".to_string(), package_name.to_string()),
+        (
+            "CARGO_CRATE_NAME".to_string(),
+            package_name.replace('-', "_"),
+        ),
+        ("CARGO_PKG_VERSION".to_string(), package_version.to_string()),
+        (
+            "CARGO_PKG_VERSION_MAJOR".to_string(),
+            version_major.to_string(),
+        ),
+        (
+            "CARGO_PKG_VERSION_MINOR".to_string(),
+            version_minor.to_string(),
+        ),
+        (
+            "CARGO_PKG_VERSION_PATCH".to_string(),
+            version_patch.to_string(),
+        ),
+        ("CARGO_PKG_VERSION_PRE".to_string(), version_pre.to_string()),
+        (
+            "CARGO_PKG_AUTHORS".to_string(),
+            package_string_array(package, "authors").join(":"),
+        ),
+        (
+            "CARGO_PKG_DESCRIPTION".to_string(),
+            package_string(package, "description"),
+        ),
+        (
+            "CARGO_PKG_HOMEPAGE".to_string(),
+            package_string(package, "homepage"),
+        ),
+        (
+            "CARGO_PKG_REPOSITORY".to_string(),
+            package_string(package, "repository"),
+        ),
+        (
+            "CARGO_PKG_LICENSE".to_string(),
+            package_string(package, "license"),
+        ),
+        (
+            "CARGO_PKG_LICENSE_FILE".to_string(),
+            package_string(package, "license-file"),
+        ),
+        (
+            "CARGO_PKG_README".to_string(),
+            package_string(package, "readme"),
+        ),
+        (
+            "CARGO_PKG_RUST_VERSION".to_string(),
+            package_string(package, "rust-version"),
+        ),
+    ];
+    if let Some(links) = package.get("links").and_then(|v| v.as_str()) {
+        env.push(("CARGO_MANIFEST_LINKS".to_string(), links.to_string()));
+    }
+
+    env.into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+fn package_string(package: &toml::map::Map<String, toml::Value>, key: &str) -> String {
+    package
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn package_string_array(package: &toml::map::Map<String, toml::Value>, key: &str) -> Vec<String> {
+    package
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn resolve_cfg_directive(context: &Context, directive: &str) -> std::io::Result<bool> {
@@ -850,19 +992,11 @@ fn expand_features(
     requested_features: &[&str],
 ) -> HashSet<String> {
     let mut enabled = HashSet::new();
-    let mut stack: Vec<String> = if requested_features.is_empty() {
-        if features_table.contains_key("default") {
-            vec!["default".to_string()]
-        } else {
-            Vec::new()
-        }
-    } else {
-        requested_features
-            .iter()
-            .filter(|feature| !feature.is_empty())
-            .map(|feature| feature.to_string())
-            .collect()
-    };
+    let mut stack: Vec<String> = requested_features
+        .iter()
+        .filter(|feature| !feature.is_empty())
+        .map(|feature| feature.to_string())
+        .collect();
 
     while let Some(feature) = stack.pop() {
         if !enabled.insert(feature.clone()) {
@@ -1023,7 +1157,7 @@ std = ["serde_alias", "dep:libc"]
             ],
         );
 
-        let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &[]).unwrap();
+        let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &["default"]).unwrap();
         assert_eq!(manifest.crate_name, "demo_lib");
         assert_eq!(manifest.crate_type, "proc-macro");
         assert_eq!(manifest.edition, "2021");
@@ -1247,6 +1381,7 @@ impl ResolverPlugin for CargoResolver {
                 })
                 .unwrap_or_default(),
         );
+        extras.insert(config_extra_keys::RUSTC_ENV, toml.rustc_env);
 
         Ok(Config {
             dependencies: deps,

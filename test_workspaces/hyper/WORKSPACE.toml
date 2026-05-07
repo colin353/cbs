@@ -1,0 +1,13 @@
+[workspace]
+cache_dir = "/tmp/cbs-test-workspaces/hyper"
+
+[toolchain.rust]
+rustc = "rustc"
+
+[target]
+family = "unix"
+os = "linux"
+env = "gnu"
+arch = "x86_64"
+vendor = "unknown"
+endian = "little"

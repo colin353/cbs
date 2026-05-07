@@ -1,0 +1,6 @@
+[[rust_binary]]
+name = "tokio_runtime"
+srcs = ["main.rs"]
+cargo_deps = [
+  { package = "tokio", version = "=0.2.25", default_features = false, features = ["rt-threaded", "macros", "time", "sync"] },
+]
