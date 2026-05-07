@@ -6,13 +6,33 @@ use crate::plugins::plugin_kind;
 #[derive(Debug)]
 pub struct CargoResolver {
     locked_dependencies: HashMap<String, HashMap<String, String>>,
+    build_recipes: HashMap<String, CargoBuildRecipe>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CargoBuildRecipe {
+    pub rustc_cfgs: Vec<String>,
 }
 
 impl CargoResolver {
     pub fn new() -> Self {
         Self {
             locked_dependencies: HashMap::new(),
+            build_recipes: HashMap::new(),
         }
+    }
+
+    pub fn with_build_recipes<I, S>(mut self, recipes: I) -> Self
+    where
+        I: IntoIterator<Item = (S, CargoBuildRecipe)>,
+        S: Into<String>,
+    {
+        self.build_recipes.extend(
+            recipes
+                .into_iter()
+                .map(|(target, recipe)| (target.into(), recipe)),
+        );
+        self
     }
 
     pub fn from_cargo_lock<P: AsRef<std::path::Path>>(
@@ -117,6 +137,7 @@ impl CargoResolver {
         Ok((
             Self {
                 locked_dependencies,
+                build_recipes: HashMap::new(),
             },
             lock_entries,
         ))
@@ -166,6 +187,7 @@ struct CargoToml {
     edition: String,
     root_source: std::path::PathBuf,
     features: Vec<String>,
+    has_build_script: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +250,17 @@ fn parse_cargo_toml(
         .and_then(|v| v.as_str())
         .unwrap_or("2015")
         .to_string();
+    let has_build_script = match package.get("build") {
+        Some(toml::Value::Boolean(false)) => false,
+        Some(toml::Value::String(_)) => true,
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo.toml package build key must be a string or false",
+            ))
+        }
+        None => manifest_dir.join("build.rs").exists(),
+    };
 
     let lib = table.get("lib").and_then(|v| v.as_table());
     let crate_name = lib
@@ -350,6 +383,7 @@ fn parse_cargo_toml(
         edition,
         root_source,
         features,
+        has_build_script,
     })
 }
 
@@ -598,6 +632,7 @@ std = ["serde_alias", "dep:libc"]
         assert_eq!(manifest.crate_type, "proc-macro");
         assert_eq!(manifest.edition, "2021");
         assert_eq!(manifest.root_source, dir.join("src/custom.rs"));
+        assert!(!manifest.has_build_script);
         assert_eq!(
             manifest.features,
             vec!["default".to_string(), "std".to_string()]
@@ -619,6 +654,43 @@ std = ["serde_alias", "dep:libc"]
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_manifest_detects_build_script() {
+        let dir = temp_dir("build-script");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("build.rs"), "").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "demo"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let context = Context::new(
+            std::env::temp_dir(),
+            std::iter::empty::<(BuildConfigKey, String)>(),
+        );
+        let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &[]).unwrap();
+        assert!(manifest.has_build_script);
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "demo"
+version = "1.0.0"
+build = false
+"#,
+        )
+        .unwrap();
+        let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &[]).unwrap();
+        assert!(!manifest.has_build_script);
     }
 
     #[test]
@@ -721,6 +793,18 @@ impl ResolverPlugin for CargoResolver {
         get_rust_files(&dest.join("src"), &mut rust_files)?;
 
         let toml = parse_cargo_toml(&context, &dest.join("Cargo.toml"), &features)?;
+        let build_recipe = if toml.has_build_script {
+            Some(self.build_recipes.get(target).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{target} declares build.rs, but no hermetic Cargo build recipe was provided"
+                    ),
+                )
+            })?)
+        } else {
+            None
+        };
 
         let mut deps = Vec::new();
         let mut dependency_aliases = Vec::new();
@@ -737,14 +821,6 @@ impl ResolverPlugin for CargoResolver {
 
         let mut extras = HashMap::new();
         extras.insert(config_extra_keys::FEATURES, toml.features);
-        let mut rustc_cfgs = Vec::new();
-        if toml.crate_name == "indexmap"
-            && extras
-                .get(&config_extra_keys::FEATURES)
-                .is_some_and(|features| features.iter().any(|feature| feature == "std"))
-        {
-            rustc_cfgs.push("has_std".to_string());
-        }
         extras.insert(config_extra_keys::CRATE_NAME, vec![toml.crate_name]);
         extras.insert(config_extra_keys::CRATE_TYPE, vec![toml.crate_type]);
         extras.insert(config_extra_keys::EDITION, vec![toml.edition]);
@@ -753,7 +829,12 @@ impl ResolverPlugin for CargoResolver {
             vec![toml.root_source.to_string_lossy().to_string()],
         );
         extras.insert(config_extra_keys::DEPENDENCY_ALIASES, dependency_aliases);
-        extras.insert(config_extra_keys::RUSTC_CFGS, rustc_cfgs);
+        extras.insert(
+            config_extra_keys::RUSTC_CFGS,
+            build_recipe
+                .map(|recipe| recipe.rustc_cfgs.clone())
+                .unwrap_or_default(),
+        );
 
         Ok(Config {
             dependencies: deps,

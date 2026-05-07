@@ -356,7 +356,7 @@ fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::CargoResolver;
+    use crate::cargo::{CargoBuildRecipe, CargoResolver};
 
     use crate::plugins::plugin_kind;
 
@@ -459,7 +459,10 @@ mod tests {
             .collect(),
         );
 
-        e.resolvers.push(Box::new(CargoResolver::new()));
+        e.resolvers.push(Box::new(
+            CargoResolver::new()
+                .with_build_recipes([("cargo://libc", CargoBuildRecipe::default())]),
+        ));
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
                 "@rust_compiler",
@@ -522,7 +525,10 @@ mod tests {
                 .collect(),
         );
 
-        e.resolvers.push(Box::new(CargoResolver::new()));
+        e.resolvers.push(Box::new(
+            CargoResolver::new()
+                .with_build_recipes([("cargo://libc", CargoBuildRecipe::default())]),
+        ));
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
                 "@rust_compiler",
@@ -570,6 +576,19 @@ mod tests {
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
         let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
+        let resolver = resolver.with_build_recipes([
+            ("cargo://httparse", CargoBuildRecipe::default()),
+            (
+                "cargo://indexmap@1.9.3",
+                CargoBuildRecipe {
+                    rustc_cfgs: vec!["has_std".to_string()],
+                },
+            ),
+            ("cargo://libc", CargoBuildRecipe::default()),
+            ("cargo://proc-macro2", CargoBuildRecipe::default()),
+            ("cargo://slab", CargoBuildRecipe::default()),
+            ("cargo://syn@1.0.109", CargoBuildRecipe::default()),
+        ]);
         lockfile.extend(
             [
                 ("cargo://bytes@0.5.6", "0.5.6,default,std"),
@@ -686,6 +705,88 @@ mod tests {
         assert_eq!(
             output.outputs[0].file_name().and_then(|name| name.to_str()),
             Some("hyper_headers")
+        );
+    }
+
+    #[test]
+    fn test_cargo_serde_derive_build() {
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
+        e.builders
+            .lock()
+            .unwrap()
+            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
+
+        let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
+        let resolver = resolver.with_build_recipes([
+            ("cargo://proc-macro2", CargoBuildRecipe::default()),
+            ("cargo://serde", CargoBuildRecipe::default()),
+        ]);
+        lockfile.extend(
+            [
+                ("cargo://proc-macro2", "1.0.71,default,proc-macro"),
+                ("cargo://quote", "1.0.33,default,proc-macro"),
+                ("cargo://serde", "1.0.193,default,std"),
+                ("cargo://serde_derive", "1.0.193,default"),
+                (
+                    "cargo://syn@2.0.43",
+                    "2.0.43,clone-impls,default,derive,parsing,printing,proc-macro,quote",
+                ),
+                ("cargo://unicode-ident", "1.0.12"),
+            ]
+            .into_iter()
+            .map(|(target, lockstring)| (target.to_string(), lockstring.to_string())),
+        );
+        e.context.lockfile = Arc::new(lockfile);
+
+        e.resolvers.push(Box::new(resolver));
+        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
+            (
+                "@rust_compiler",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/Users/colinwm/.cargo/bin/rustc".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "@rust_plugin",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/tmp/rust.cdylib".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "//:serde_derive_smoke",
+                Ok(Config {
+                    build_plugin: "@rust_plugin".to_string(),
+                    sources: vec![
+                        "/Users/colinwm/Documents/code/cbs/data/serde_derive_smoke.rs".to_string(),
+                    ],
+                    dependencies: vec![
+                        "cargo://serde".to_string(),
+                        "cargo://serde_derive".to_string(),
+                    ],
+                    build_dependencies: vec!["@rust_compiler".to_string()],
+                    kind: plugin_kind::RUST_BINARY.to_string(),
+                    ..Default::default()
+                }),
+            ),
+        ])));
+
+        let id = e.add_task("//:serde_derive_smoke", None);
+        let result = e.run(&[id]);
+
+        let BuildResult::Success(output) = result else {
+            panic!("serde derive build failed");
+        };
+        assert_eq!(
+            output.outputs[0].file_name().and_then(|name| name.to_str()),
+            Some("serde_derive_smoke")
         );
     }
 }
