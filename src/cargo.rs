@@ -1,7 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::cargo_recipes;
-use crate::core::{config_extra_keys, BuildConfigKey, Config, Context, ResolverPlugin};
+use crate::core::{
+    config_extra_keys, BuildConfigKey, Config, Context, DependencyPlan, DependencyPlannerPlugin,
+    ExternalRequirement, ResolverPlugin,
+};
 use crate::plugins::plugin_kind;
 
 #[derive(Debug)]
@@ -9,6 +12,9 @@ pub struct CargoResolver {
     locked_dependencies: HashMap<String, HashMap<String, String>>,
     build_recipes: HashMap<String, CargoBuildRecipe>,
 }
+
+#[derive(Debug)]
+pub struct CargoDependencyPlanner {}
 
 #[derive(Debug, Clone, Default)]
 pub struct CargoBuildRecipe {
@@ -188,6 +194,337 @@ impl CargoResolver {
             lock_entries,
         ))
     }
+}
+
+impl CargoDependencyPlanner {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl DependencyPlannerPlugin for CargoDependencyPlanner {
+    fn ecosystem(&self) -> &str {
+        "cargo"
+    }
+
+    fn plan(
+        &self,
+        context: Context,
+        requirements: &[ExternalRequirement],
+    ) -> std::io::Result<DependencyPlan> {
+        if requirements.is_empty() {
+            return Ok(DependencyPlan::default());
+        }
+
+        let manifest = synthetic_manifest(requirements)?;
+        let workdir = context.cache_dir.join("dependency-plans").join("cargo");
+        std::fs::create_dir_all(workdir.join("src"))?;
+        let manifest_path = workdir.join("Cargo.toml");
+        std::fs::write(&manifest_path, manifest)?;
+        std::fs::write(workdir.join("src").join("lib.rs"), "")?;
+
+        let mut args = vec![
+            "metadata".to_string(),
+            "--format-version=1".to_string(),
+            "--manifest-path".to_string(),
+            manifest_path.to_string_lossy().to_string(),
+        ];
+        if let Some(target) = cargo_filter_platform(&context) {
+            args.push("--filter-platform".to_string());
+            args.push(target);
+        }
+
+        let output = context
+            .actions
+            .run_process(&context, "cargo", &args)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
+        metadata_to_dependency_plan(&context, requirements, &output)
+    }
+}
+
+#[derive(Debug)]
+struct CargoMetadataPackage {
+    id: String,
+    name: String,
+    version: String,
+    manifest_path: std::path::PathBuf,
+}
+
+fn synthetic_manifest(requirements: &[ExternalRequirement]) -> std::io::Result<String> {
+    #[derive(Default)]
+    struct RootRequirement {
+        version: String,
+        features: Vec<String>,
+        default_features: bool,
+    }
+
+    let mut deps: BTreeMap<String, RootRequirement> = BTreeMap::new();
+    for req in requirements {
+        if req.ecosystem != "cargo" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cargo dependency planner cannot resolve {} requirement {}",
+                    req.ecosystem, req.package
+                ),
+            ));
+        }
+        let dep = deps
+            .entry(req.package.clone())
+            .or_insert_with(|| RootRequirement {
+                version: req.version.clone(),
+                default_features: req.default_features,
+                ..Default::default()
+            });
+        if dep.version != req.version {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "conflicting cargo requirements for {}: {} and {}",
+                    req.package, dep.version, req.version
+                ),
+            ));
+        }
+        dep.default_features |= req.default_features;
+        dep.features.extend(req.features.iter().cloned());
+        dep.features.sort();
+        dep.features.dedup();
+    }
+
+    let mut manifest = r#"[package]
+name = "cbs-cargo-plan"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+"#
+    .to_string();
+    for (package, dep) in deps {
+        manifest.push_str(&format!(
+            "\"{}\" = {{ package = \"{}\", version = \"{}\", default-features = {}, features = [{}] }}\n",
+            toml_escape(&package),
+            toml_escape(&package),
+            toml_escape(&dep.version),
+            dep.default_features,
+            dep.features
+                .iter()
+                .map(|feature| format!("\"{}\"", toml_escape(feature)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn metadata_to_dependency_plan(
+    context: &Context,
+    requirements: &[ExternalRequirement],
+    metadata: &[u8],
+) -> std::io::Result<DependencyPlan> {
+    let metadata: serde_json::Value = serde_json::from_slice(metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let root_id = metadata
+        .get("resolve")
+        .and_then(|resolve| resolve.get("root"))
+        .and_then(|root| root.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let packages = metadata
+        .get("packages")
+        .and_then(|packages| packages.as_array())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata missing packages")
+        })?;
+
+    let mut package_infos = HashMap::new();
+    let mut package_counts: HashMap<String, usize> = HashMap::new();
+    for package in packages {
+        let info = parse_metadata_package(package)?;
+        if info.id != root_id {
+            *package_counts.entry(info.name.clone()).or_default() += 1;
+        }
+        package_infos.insert(info.id.clone(), info);
+    }
+
+    let mut id_to_target = HashMap::new();
+    let mut lockfile = HashMap::new();
+    for info in package_infos.values().filter(|info| info.id != root_id) {
+        let target = cargo_target_name(&info.name, &info.version, &package_counts);
+        let versioned_target = format!("cargo://{}@{}", info.name, info.version);
+        id_to_target.insert(info.id.clone(), target.clone());
+        lockfile.insert(target, info.version.clone());
+        lockfile.insert(versioned_target, info.version.clone());
+    }
+
+    let nodes = metadata
+        .get("resolve")
+        .and_then(|resolve| resolve.get("nodes"))
+        .and_then(|nodes| nodes.as_array())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata resolve missing nodes",
+            )
+        })?;
+    let mut locked_dependencies = HashMap::new();
+    for node in nodes {
+        let id = node.get("id").and_then(|id| id.as_str()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata node missing id")
+        })?;
+        if id == root_id {
+            continue;
+        }
+        let Some(info) = package_infos.get(id) else {
+            continue;
+        };
+        let Some(target) = id_to_target.get(id).cloned() else {
+            continue;
+        };
+        let features = node_features(node)?;
+        lockfile.insert(target.clone(), lockstring(&info.version, &features));
+        lockfile.insert(
+            format!("cargo://{}@{}", info.name, info.version),
+            lockstring(&info.version, &features),
+        );
+        validate_metadata_package(context, info, &features)?;
+
+        let mut deps = HashMap::new();
+        for dep in node
+            .get("deps")
+            .and_then(|deps| deps.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(dep_id) = dep.get("pkg").and_then(|pkg| pkg.as_str()) else {
+                continue;
+            };
+            let Some(dep_target) = id_to_target.get(dep_id) else {
+                continue;
+            };
+            if let Some(dep_info) = package_infos.get(dep_id) {
+                deps.insert(dep_info.name.clone(), dep_target.clone());
+            }
+            if let Some(dep_name) = dep.get("name").and_then(|name| name.as_str()) {
+                deps.insert(dep_name.replace('_', "-"), dep_target.clone());
+                deps.insert(dep_name.to_string(), dep_target.clone());
+            }
+        }
+        locked_dependencies.insert(target.clone(), deps.clone());
+        locked_dependencies.insert(format!("cargo://{}@{}", info.name, info.version), deps);
+    }
+
+    for req in requirements {
+        let Some(target) = req.target.as_ref() else {
+            continue;
+        };
+        let Some(info) = package_infos
+            .values()
+            .find(|info| info.id != root_id && info.name == req.package)
+        else {
+            continue;
+        };
+        let resolved_target = cargo_target_name(&info.name, &info.version, &package_counts);
+        if let Some(lockstring) = lockfile.get(&resolved_target).cloned() {
+            lockfile.insert(target.clone(), lockstring);
+        }
+        if let Some(deps) = locked_dependencies.get(&resolved_target).cloned() {
+            locked_dependencies.insert(target.clone(), deps);
+        }
+    }
+
+    Ok(DependencyPlan {
+        lockfile,
+        locked_dependencies,
+    })
+}
+
+fn parse_metadata_package(package: &serde_json::Value) -> std::io::Result<CargoMetadataPackage> {
+    let string_field = |field: &str| {
+        package
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("metadata package missing {field}"),
+                )
+            })
+    };
+    Ok(CargoMetadataPackage {
+        id: string_field("id")?,
+        name: string_field("name")?,
+        version: string_field("version")?,
+        manifest_path: std::path::PathBuf::from(string_field("manifest_path")?),
+    })
+}
+
+fn node_features(node: &serde_json::Value) -> std::io::Result<Vec<String>> {
+    let mut features: Vec<_> = node
+        .get("features")
+        .and_then(|features| features.as_array())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata node missing features",
+            )
+        })?
+        .iter()
+        .filter_map(|feature| feature.as_str().map(|feature| feature.to_string()))
+        .collect();
+    features.sort();
+    features.dedup();
+    Ok(features)
+}
+
+fn validate_metadata_package(
+    context: &Context,
+    info: &CargoMetadataPackage,
+    features: &[String],
+) -> std::io::Result<()> {
+    let feature_refs: Vec<_> = features.iter().map(|feature| feature.as_str()).collect();
+    let manifest = parse_cargo_toml(context, &info.manifest_path, &feature_refs)?;
+    if manifest.has_build_script
+        && cargo_recipes::build_recipe(context, &info.name, &info.version).is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} {} declares build.rs, but no hermetic Cargo build recipe is available",
+                info.name, info.version
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn lockstring(version: &str, features: &[String]) -> String {
+    if features.is_empty() {
+        return version.to_string();
+    }
+    format!("{version},{}", features.join(","))
+}
+
+fn cargo_filter_platform(context: &Context) -> Option<String> {
+    let arch = context.get_config(BuildConfigKey::TargetArch)?;
+    let vendor = context.get_config(BuildConfigKey::TargetVendor)?;
+    let os = match context.get_config(BuildConfigKey::TargetOS)? {
+        "macos" => "darwin",
+        os => os,
+    };
+    let env = context
+        .get_config(BuildConfigKey::TargetEnv)
+        .unwrap_or_default();
+    if env.is_empty() {
+        Some(format!("{arch}-{vendor}-{os}"))
+    } else {
+        Some(format!("{arch}-{vendor}-{os}-{env}"))
+    }
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn get_rust_files(
@@ -870,6 +1207,7 @@ impl ResolverPlugin for CargoResolver {
                 .get(target)
                 .and_then(|deps| deps.get(&dep.package))
                 .cloned()
+                .or_else(|| context.get_locked_dependency(target, &dep.package))
                 .unwrap_or_else(|| format!("cargo://{}", dep.package));
             dependency_aliases.push(format!("{dep_target}={}", dep.alias.replace('-', "_")));
             deps.push(dep_target);
@@ -912,6 +1250,7 @@ impl ResolverPlugin for CargoResolver {
 
         Ok(Config {
             dependencies: deps,
+            external_requirements: Vec::new(),
             build_plugin: "@rust_plugin".to_string(),
             location: None,
             sources: rust_files

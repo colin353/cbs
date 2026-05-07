@@ -1,5 +1,5 @@
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -8,6 +8,7 @@ pub struct Context {
     pub start_time: std::time::Instant,
     pub actions: BuildActions,
     pub lockfile: Arc<HashMap<String, String>>,
+    pub locked_dependencies: Arc<HashMap<String, HashMap<String, String>>>,
     pub cache_dir: std::path::PathBuf,
     pub target: Option<String>,
     pub target_hash: Option<u64>,
@@ -90,6 +91,7 @@ impl BuildResult {
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub dependencies: Vec<String>,
+    pub external_requirements: Vec<ExternalRequirement>,
     pub build_plugin: String,
     pub location: Option<String>,
     pub sources: Vec<String>,
@@ -97,6 +99,30 @@ pub struct Config {
     pub kind: String,
     pub extras: HashMap<u32, Vec<String>>,
     pub hash: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalRequirement {
+    pub ecosystem: String,
+    pub package: String,
+    pub version: String,
+    pub features: Vec<String>,
+    pub default_features: bool,
+    pub target: Option<String>,
+}
+
+impl ExternalRequirement {
+    pub fn target(&self) -> String {
+        self.target
+            .clone()
+            .unwrap_or_else(|| format!("{}://{}", self.ecosystem, self.package))
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DependencyPlan {
+    pub lockfile: HashMap<String, String>,
+    pub locked_dependencies: HashMap<String, HashMap<String, String>>,
 }
 
 pub mod config_extra_keys {
@@ -112,10 +138,28 @@ pub mod config_extra_keys {
 }
 
 impl Config {
-    pub fn dependencies(&self) -> Vec<&str> {
-        let mut out: Vec<_> = self.dependencies.iter().map(|s| s.as_str()).collect();
-        out.push(self.build_plugin.as_str());
-        out.extend(self.build_dependencies.iter().map(|s| s.as_str()));
+    pub fn dependencies(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for dep in &self.dependencies {
+            if seen.insert(dep.clone()) {
+                out.push(dep.clone());
+            }
+        }
+        for req in &self.external_requirements {
+            let target = req.target();
+            if seen.insert(target.clone()) {
+                out.push(target);
+            }
+        }
+        if seen.insert(self.build_plugin.clone()) {
+            out.push(self.build_plugin.clone());
+        }
+        for dep in &self.build_dependencies {
+            if seen.insert(dep.clone()) {
+                out.push(dep.clone());
+            }
+        }
         out
     }
 
@@ -215,6 +259,20 @@ impl Task {
 pub trait ResolverPlugin: std::fmt::Debug {
     fn can_resolve(&self, target: &str) -> bool;
     fn resolve(&self, context: Context, target: &str) -> std::io::Result<Config>;
+}
+
+pub trait DependencyPlannerPlugin: std::fmt::Debug {
+    fn ecosystem(&self) -> &str;
+
+    fn can_plan_target(&self, target: &str) -> bool {
+        target.starts_with(&format!("{}://", self.ecosystem()))
+    }
+
+    fn plan(
+        &self,
+        context: Context,
+        requirements: &[ExternalRequirement],
+    ) -> std::io::Result<DependencyPlan>;
 }
 
 pub trait BuildPlugin: std::fmt::Debug {

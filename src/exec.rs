@@ -11,6 +11,7 @@ pub struct Executor {
     tasks: Mutex<TaskGraph>,
 
     resolvers: Vec<Box<dyn ResolverPlugin>>,
+    dependency_planners: Vec<Box<dyn DependencyPlannerPlugin>>,
     builders: Mutex<HashMap<String, Arc<dyn BuildPlugin>>>,
 }
 
@@ -31,6 +32,7 @@ impl Executor {
             tasks: Mutex::new(TaskGraph::new()),
 
             resolvers: Vec::new(),
+            dependency_planners: Vec::new(),
             builders: Mutex::new(HashMap::new()),
         }
     }
@@ -43,6 +45,7 @@ impl Executor {
             tasks: Mutex::new(TaskGraph::new()),
 
             resolvers: Vec::new(),
+            dependency_planners: Vec::new(),
             builders: Mutex::new(HashMap::new()),
         }
     }
@@ -76,7 +79,11 @@ impl Executor {
         None
     }
 
-    pub fn run(&self, roots: &[usize]) -> BuildResult {
+    pub fn run(&mut self, roots: &[usize]) -> BuildResult {
+        if let Err(e) = self.plan_external_dependencies() {
+            return BuildResult::Failure(format!("dependency planning failed: {e:#?}"));
+        }
+
         while let Some(task) = self.next_task() {
             match task.status() {
                 TaskStatus::Resolving => self.resolve(task),
@@ -113,6 +120,78 @@ impl Executor {
                 .as_ref()
                 .expect("result must be available")
         }))
+    }
+
+    fn plan_external_dependencies(&mut self) -> std::io::Result<()> {
+        while let Some(task) = self.next_planning_task() {
+            self.resolve(task);
+        }
+
+        let mut requirements: HashMap<String, Vec<ExternalRequirement>> = HashMap::new();
+        {
+            let graph = self.tasks.lock().unwrap();
+            for task in &graph.tasks {
+                let Some(config) = task.config.as_ref() else {
+                    continue;
+                };
+                for req in &config.external_requirements {
+                    requirements
+                        .entry(req.ecosystem.clone())
+                        .or_default()
+                        .push(req.clone());
+                }
+            }
+        }
+
+        if requirements.is_empty() {
+            return Ok(());
+        }
+
+        let mut lockfile = self.context.lockfile.as_ref().clone();
+        let mut locked_dependencies = self.context.locked_dependencies.as_ref().clone();
+        for (ecosystem, reqs) in requirements {
+            let planner = self
+                .dependency_planners
+                .iter()
+                .find(|planner| planner.ecosystem() == ecosystem)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no dependency planner registered for ecosystem {ecosystem}"),
+                    )
+                })?;
+            let plan = planner.plan(self.context.clone(), &reqs)?;
+            lockfile.extend(plan.lockfile);
+            locked_dependencies.extend(plan.locked_dependencies);
+        }
+
+        self.context.lockfile = Arc::new(lockfile);
+        self.context.locked_dependencies = Arc::new(locked_dependencies);
+        self.context.calculate_hash();
+        Ok(())
+    }
+
+    fn next_planning_task(&self) -> Option<Task> {
+        let mut graph = self.tasks.lock().unwrap();
+        for task in &mut graph.tasks {
+            if !task.available || task.status() != TaskStatus::Resolving {
+                continue;
+            }
+            if self.should_defer_external_target(&task.target) {
+                continue;
+            }
+            task.available = false;
+            return Some(task.clone());
+        }
+        None
+    }
+
+    fn should_defer_external_target(&self, target: &str) -> bool {
+        self.context.get_locked_version(target).is_err()
+            && self
+                .dependency_planners
+                .iter()
+                .any(|planner| planner.can_plan_target(target))
     }
 
     pub fn resolve(&self, task: Task) {
@@ -200,7 +279,7 @@ impl Executor {
         {
             let graph = self.tasks.lock().unwrap();
             for dep in config.dependencies() {
-                let dt = match graph.by_target.get(dep) {
+                let dt = match graph.by_target.get(&dep) {
                     Some(t) => &graph.tasks[*t],
                     None => {
                         panic!("all dependencies must exist by now!");
@@ -356,7 +435,7 @@ fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::CargoResolver;
+    use crate::cargo::{CargoDependencyPlanner, CargoResolver};
 
     use crate::plugins::plugin_kind;
 
@@ -436,29 +515,8 @@ mod tests {
             .unwrap()
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
-        e.context.lockfile = Arc::new(
-            vec![
-                (
-                    "cargo://rand".to_string(),
-                    "0.8.5,std,libc,alloc,std_rng,getrandom".to_string(),
-                ),
-                (
-                    "cargo://rand_core".to_string(),
-                    "0.6.0,alloc,std,getrandom".to_string(),
-                ),
-                ("cargo://libc".to_string(), "0.2.151".to_string()),
-                (
-                    "cargo://getrandom".to_string(),
-                    "0.2.11,alloc,std,getrandom".to_string(),
-                ),
-                ("cargo://cfg-if".to_string(), "1.0.0".to_string()),
-                ("cargo://rand_chacha".to_string(), "0.3.1".to_string()),
-                ("cargo://ppv-lite86".to_string(), "0.2.17".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-        );
-
+        e.dependency_planners
+            .push(Box::new(CargoDependencyPlanner::new()));
         e.resolvers.push(Box::new(CargoResolver::new()));
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
@@ -482,7 +540,14 @@ mod tests {
                 Ok(Config {
                     build_plugin: "@rust_plugin".to_string(),
                     sources: vec!["/Users/colinwm/Documents/code/cbs/data/dice_roll.rs".to_string()],
-                    dependencies: vec!["cargo://rand".to_string()],
+                    external_requirements: vec![ExternalRequirement {
+                        ecosystem: "cargo".to_string(),
+                        package: "rand".to_string(),
+                        version: "=0.8.5".to_string(),
+                        features: vec!["std".to_string(), "std_rng".to_string()],
+                        default_features: true,
+                        target: None,
+                    }],
                     build_dependencies: vec!["@rust_compiler".to_string()],
                     kind: plugin_kind::RUST_BINARY.to_string(),
                     ..Default::default()
@@ -496,7 +561,7 @@ mod tests {
         // e.print_all_logs();
 
         let BuildResult::Success(output) = result else {
-            panic!("cargo build failed");
+            panic!("cargo build failed: {result:?}");
         };
         assert_eq!(
             output.outputs[0].file_name().and_then(|name| name.to_str()),
@@ -612,8 +677,8 @@ mod tests {
                 ("cargo://pin-project-lite@0.1.12", "0.1.12"),
                 ("cargo://pin-project-lite@0.2.13", "0.2.13"),
                 ("cargo://pin-utils", "0.1.0"),
-                ("cargo://proc-macro2", "1.0.71,default,proc-macro"),
-                ("cargo://quote", "1.0.33,default,proc-macro"),
+                ("cargo://proc-macro2", "1.0.106,default,proc-macro"),
+                ("cargo://quote", "1.0.45,default,proc-macro"),
                 ("cargo://signal-hook-registry", "1.4.1"),
                 ("cargo://slab", "0.4.9,default,std"),
                 ("cargo://socket2", "0.3.19"),
@@ -622,8 +687,8 @@ mod tests {
                     "1.0.109,clone-impls,default,derive,full,parsing,printing,proc-macro,quote",
                 ),
                 (
-                    "cargo://syn@2.0.43",
-                    "2.0.43,clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut",
+                    "cargo://syn@2.0.117",
+                    "2.0.117,clone-impls,default,derive,full,parsing,printing,proc-macro,quote,visit-mut",
                 ),
                 (
                     "cargo://tokio",
@@ -701,7 +766,33 @@ mod tests {
             .unwrap()
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
-        let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
+        let resolver = CargoResolver::new().with_locked_dependencies([
+            (
+                "cargo://proc-macro2",
+                vec![("unicode_ident", "cargo://unicode-ident")],
+            ),
+            (
+                "cargo://quote",
+                vec![("proc_macro2", "cargo://proc-macro2")],
+            ),
+            (
+                "cargo://serde_derive",
+                vec![
+                    ("proc_macro2", "cargo://proc-macro2"),
+                    ("quote", "cargo://quote"),
+                    ("syn", "cargo://syn@2.0.43"),
+                ],
+            ),
+            (
+                "cargo://syn@2.0.43",
+                vec![
+                    ("proc_macro2", "cargo://proc-macro2"),
+                    ("quote", "cargo://quote"),
+                    ("unicode_ident", "cargo://unicode-ident"),
+                ],
+            ),
+        ]);
+        let mut lockfile = HashMap::new();
         lockfile.extend(
             [
                 ("cargo://proc-macro2", "1.0.71,default,proc-macro"),

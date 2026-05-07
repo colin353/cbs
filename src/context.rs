@@ -12,6 +12,7 @@ impl Context {
         Self {
             actions: BuildActions::new(),
             lockfile: Arc::new(HashMap::new()),
+            locked_dependencies: Arc::new(HashMap::new()),
             start_time: std::time::Instant::now(),
             cache_dir,
             target: None,
@@ -63,6 +64,13 @@ impl Context {
                 std::io::ErrorKind::NotFound,
                 format!("{target} does not have a lockfile entry!"),
             ))
+    }
+
+    pub fn get_locked_dependency(&self, target: &str, package: &str) -> Option<String> {
+        self.locked_dependencies
+            .get(target)
+            .and_then(|deps| deps.get(package))
+            .cloned()
     }
 
     pub fn log<S: Into<String>>(&self, message: S) {

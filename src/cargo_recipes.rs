@@ -11,9 +11,12 @@ pub fn build_recipe(context: &Context, package: &str, version: &str) -> Option<C
         | ("quote", "1.0.45")
         | ("rustls", "0.23.31")
         | ("serde", "1.0.193")
+        | ("serde", "1.0.228")
+        | ("serde_core", "1.0.228")
         | ("slab", "0.4.9")
         | ("slab", "0.4.12")
-        | ("syn", "1.0.109") => Some(CargoBuildRecipe::default()),
+        | ("syn", "1.0.109")
+        | ("zerocopy", "0.8.48") => Some(CargoBuildRecipe::default()),
         ("indexmap", "1.9.3") => Some(CargoBuildRecipe {
             rustc_cfgs: vec!["has_std".to_string()],
             ..Default::default()

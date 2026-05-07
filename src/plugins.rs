@@ -86,8 +86,8 @@ impl RustPlugin {
         };
 
         let dependency_aliases = dependency_aliases(&config);
-        let libraries: Vec<_> = config
-            .dependencies
+        let runtime_dependencies = runtime_dependencies(&config);
+        let libraries: Vec<_> = runtime_dependencies
             .iter()
             .map(|t| {
                 deps.get(t)
@@ -107,8 +107,7 @@ impl RustPlugin {
             .flatten()
             .collect();
 
-        let transitive_deps: Vec<(String, String)> = config
-            .dependencies
+        let transitive_deps: Vec<(String, String)> = runtime_dependencies
             .iter()
             .map(|t| {
                 deps.get(t)
@@ -256,8 +255,8 @@ impl RustPlugin {
         let out_file = working_directory.join(name);
 
         let dependency_aliases = dependency_aliases(&config);
-        let libraries: Vec<_> = config
-            .dependencies
+        let runtime_dependencies = runtime_dependencies(&config);
+        let libraries: Vec<_> = runtime_dependencies
             .iter()
             .map(|t| {
                 deps.get(t)
@@ -277,8 +276,7 @@ impl RustPlugin {
             .flatten()
             .collect();
 
-        let transitive_deps: Vec<(String, String)> = config
-            .dependencies
+        let transitive_deps: Vec<(String, String)> = runtime_dependencies
             .iter()
             .map(|t| {
                 deps.get(t)
@@ -385,6 +383,19 @@ fn dependency_aliases(config: &Config) -> HashMap<String, String> {
             Some((target.to_string(), crate_name.to_string()))
         })
         .collect()
+}
+
+fn runtime_dependencies(config: &Config) -> Vec<String> {
+    let mut deps = config.dependencies.clone();
+    deps.extend(
+        config
+            .external_requirements
+            .iter()
+            .map(|requirement| requirement.target()),
+    );
+    deps.sort();
+    deps.dedup();
+    deps
 }
 
 struct NativeStaticLib {
