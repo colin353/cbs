@@ -12,6 +12,15 @@ pub struct CargoResolver {
 #[derive(Debug, Clone, Default)]
 pub struct CargoBuildRecipe {
     pub rustc_cfgs: Vec<String>,
+    pub native_static_libs: Vec<CargoNativeStaticLib>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CargoNativeStaticLib {
+    pub name: String,
+    pub sources: Vec<String>,
+    pub include_dirs: Vec<String>,
+    pub flags: Vec<String>,
 }
 
 impl CargoResolver {
@@ -449,6 +458,9 @@ fn resolve_cfg_directive(context: &Context, directive: &str) -> std::io::Result<
             "target_family" => context.get_config(BuildConfigKey::TargetFamily) == Some(value),
             "target_os" => context.get_config(BuildConfigKey::TargetOS) == Some(value),
             "target_env" => context.get_config(BuildConfigKey::TargetEnv) == Some(value),
+            "target_arch" => context.get_config(BuildConfigKey::TargetArch) == Some(value),
+            "target_vendor" => context.get_config(BuildConfigKey::TargetVendor) == Some(value),
+            "target_endian" => context.get_config(BuildConfigKey::TargetEndian) == Some(value),
             _ => false,
         });
     }
@@ -590,6 +602,16 @@ fn cargo_target_name(
     } else {
         format!("cargo://{package_name}")
     }
+}
+
+fn encode_native_static_lib(lib: &CargoNativeStaticLib) -> String {
+    [
+        lib.name.as_str(),
+        &lib.sources.join(";"),
+        &lib.include_dirs.join(";"),
+        &lib.flags.join(";"),
+    ]
+    .join("|")
 }
 
 #[cfg(test)]
@@ -848,11 +870,27 @@ impl ResolverPlugin for CargoResolver {
             config_extra_keys::ROOT_SOURCE,
             vec![toml.root_source.to_string_lossy().to_string()],
         );
+        extras.insert(
+            config_extra_keys::CRATE_ROOT,
+            vec![dest.to_string_lossy().to_string()],
+        );
         extras.insert(config_extra_keys::DEPENDENCY_ALIASES, dependency_aliases);
         extras.insert(
             config_extra_keys::RUSTC_CFGS,
             build_recipe
                 .map(|recipe| recipe.rustc_cfgs.clone())
+                .unwrap_or_default(),
+        );
+        extras.insert(
+            config_extra_keys::NATIVE_STATIC_LIBS,
+            build_recipe
+                .map(|recipe| {
+                    recipe
+                        .native_static_libs
+                        .iter()
+                        .map(encode_native_static_lib)
+                        .collect()
+                })
                 .unwrap_or_default(),
         );
 

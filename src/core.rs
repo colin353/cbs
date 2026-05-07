@@ -21,6 +21,9 @@ pub enum BuildConfigKey {
     TargetFamily = 1,
     TargetEnv,
     TargetOS,
+    TargetArch,
+    TargetVendor,
+    TargetEndian,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,8 @@ pub mod config_extra_keys {
     pub const ROOT_SOURCE: u32 = 4;
     pub const DEPENDENCY_ALIASES: u32 = 5;
     pub const RUSTC_CFGS: u32 = 6;
+    pub const CRATE_ROOT: u32 = 7;
+    pub const NATIVE_STATIC_LIBS: u32 = 8;
 }
 
 impl Config {

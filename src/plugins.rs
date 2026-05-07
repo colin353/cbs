@@ -78,6 +78,12 @@ impl RustPlugin {
                 }
             }
         };
+        let native_libs = match build_native_static_libs(context, &config, &working_directory) {
+            Ok(libs) => libs,
+            Err(e) => {
+                return BuildResult::Failure(format!("failed to build native static libs: {e:?}"))
+            }
+        };
 
         let dependency_aliases = dependency_aliases(&config);
         let libraries: Vec<_> = config
@@ -134,6 +140,24 @@ impl RustPlugin {
                 .into_iter()
             })
             .flatten();
+        let native_link_args = native_libs
+            .iter()
+            .map(|lib| {
+                vec![
+                    "-L".to_string(),
+                    format!(
+                        "native={}",
+                        lib.path
+                            .parent()
+                            .expect("native lib must have a parent")
+                            .to_string_lossy()
+                    ),
+                    "-l".to_string(),
+                    format!("static={}", lib.name),
+                ]
+                .into_iter()
+            })
+            .flatten();
 
         let extern_crates = libraries
             .clone()
@@ -156,6 +180,7 @@ impl RustPlugin {
         args.push(root_source);
         args.extend(extern_crates);
         args.extend(transitive_libraries);
+        args.extend(native_link_args);
         args.extend(features);
         args.extend(rustc_cfgs);
 
@@ -185,6 +210,12 @@ impl RustPlugin {
 
         let tdeps = transitive_deps
             .into_iter()
+            .chain(native_libs.iter().map(|lib| {
+                (
+                    format!("native_{}", lib.name),
+                    lib.path.display().to_string(),
+                )
+            }))
             .map(|(name, path)| format!("{name}:{path}"))
             .collect();
 
@@ -354,6 +385,108 @@ fn dependency_aliases(config: &Config) -> HashMap<String, String> {
             Some((target.to_string(), crate_name.to_string()))
         })
         .collect()
+}
+
+struct NativeStaticLib {
+    name: String,
+    sources: Vec<String>,
+    include_dirs: Vec<String>,
+    flags: Vec<String>,
+}
+
+struct NativeStaticLibOutput {
+    name: String,
+    path: std::path::PathBuf,
+}
+
+fn build_native_static_libs(
+    context: &Context,
+    config: &Config,
+    working_directory: &std::path::Path,
+) -> std::io::Result<Vec<NativeStaticLibOutput>> {
+    let crate_root = match config.get(config_extra_keys::CRATE_ROOT).first() {
+        Some(root) => std::path::PathBuf::from(root),
+        None => return Ok(Vec::new()),
+    };
+
+    let native_dir = working_directory.join("native");
+    std::fs::create_dir_all(&native_dir)?;
+
+    config
+        .get(config_extra_keys::NATIVE_STATIC_LIBS)
+        .iter()
+        .map(|encoded| {
+            let lib = parse_native_static_lib(encoded)?;
+            let lib_dir = native_dir.join(&lib.name);
+            std::fs::create_dir_all(&lib_dir)?;
+
+            let mut objects = Vec::new();
+            for (idx, source) in lib.sources.iter().enumerate() {
+                let source_path = crate_root.join(source);
+                let object_path = lib_dir.join(format!("{idx}-{}.o", sanitize_path(source)));
+                let mut args = vec![
+                    "-c".to_string(),
+                    source_path.to_string_lossy().to_string(),
+                    "-o".to_string(),
+                    object_path.to_string_lossy().to_string(),
+                ];
+                for include_dir in &lib.include_dirs {
+                    args.push("-I".to_string());
+                    args.push(crate_root.join(include_dir).to_string_lossy().to_string());
+                }
+                args.extend(lib.flags.iter().cloned());
+                context.actions.run_process(context, "cc", &args)?;
+                objects.push(object_path);
+            }
+
+            let archive_path = lib_dir.join(format!("lib{}.a", lib.name));
+            let mut args = vec![
+                "crs".to_string(),
+                archive_path.to_string_lossy().to_string(),
+            ];
+            args.extend(
+                objects
+                    .iter()
+                    .map(|object| object.to_string_lossy().to_string()),
+            );
+            context.actions.run_process(context, "ar", &args)?;
+
+            Ok(NativeStaticLibOutput {
+                name: lib.name,
+                path: archive_path,
+            })
+        })
+        .collect()
+}
+
+fn parse_native_static_lib(encoded: &str) -> std::io::Result<NativeStaticLib> {
+    let mut parts = encoded.split('|');
+    let name = parts.next().unwrap_or_default();
+    if name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native static lib is missing a name",
+        ));
+    }
+
+    Ok(NativeStaticLib {
+        name: name.to_string(),
+        sources: split_recipe_list(parts.next().unwrap_or_default()),
+        include_dirs: split_recipe_list(parts.next().unwrap_or_default()),
+        flags: split_recipe_list(parts.next().unwrap_or_default()),
+    })
+}
+
+fn split_recipe_list(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn sanitize_path(path: &str) -> String {
+    path.replace(['/', '.', '-'], "_")
 }
 
 fn dylib_extension() -> &'static str {

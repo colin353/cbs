@@ -356,9 +356,68 @@ fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::{CargoBuildRecipe, CargoResolver};
+    use crate::cargo::{CargoBuildRecipe, CargoNativeStaticLib, CargoResolver};
 
     use crate::plugins::plugin_kind;
+
+    fn ring_native_static_lib() -> CargoNativeStaticLib {
+        CargoNativeStaticLib {
+            name: "ring_core_0_17_14_".to_string(),
+            sources: vec![
+                "crypto/curve25519/curve25519.c",
+                "crypto/fipsmodule/aes/aes_nohw.c",
+                "crypto/fipsmodule/bn/montgomery.c",
+                "crypto/fipsmodule/bn/montgomery_inv.c",
+                "crypto/fipsmodule/ec/ecp_nistz.c",
+                "crypto/fipsmodule/ec/gfp_p256.c",
+                "crypto/fipsmodule/ec/gfp_p384.c",
+                "crypto/fipsmodule/ec/p256.c",
+                "crypto/limbs/limbs.c",
+                "crypto/mem.c",
+                "crypto/poly1305/poly1305.c",
+                "crypto/fipsmodule/ec/p256-nistz.c",
+                "pregenerated/aesv8-armx-ios64.S",
+                "pregenerated/aesv8-gcm-armv8-ios64.S",
+                "pregenerated/ghash-neon-armv8-ios64.S",
+                "pregenerated/ghashv8-armx-ios64.S",
+                "pregenerated/p256-armv8-asm-ios64.S",
+                "pregenerated/sha256-armv8-ios64.S",
+                "pregenerated/sha512-armv8-ios64.S",
+                "pregenerated/chacha-armv8-ios64.S",
+                "pregenerated/chacha20_poly1305_armv8-ios64.S",
+                "pregenerated/armv8-mont-ios64.S",
+                "pregenerated/vpaes-armv8-ios64.S",
+            ]
+            .into_iter()
+            .map(|source| source.to_string())
+            .collect(),
+            include_dirs: vec!["include".to_string(), "pregenerated".to_string()],
+            flags: vec![
+                "-fvisibility=hidden",
+                "-std=c1x",
+                "-Wall",
+                "-Wbad-function-cast",
+                "-Wcast-align",
+                "-Wcast-qual",
+                "-Wconversion",
+                "-Wmissing-field-initializers",
+                "-Wmissing-include-dirs",
+                "-Wnested-externs",
+                "-Wredundant-decls",
+                "-Wshadow",
+                "-Wsign-compare",
+                "-Wsign-conversion",
+                "-Wstrict-prototypes",
+                "-Wundef",
+                "-Wuninitialized",
+                "-gfull",
+                "-DNDEBUG",
+            ]
+            .into_iter()
+            .map(|flag| flag.to_string())
+            .collect(),
+        }
+    }
 
     #[test]
     fn test_execution() {
@@ -582,6 +641,7 @@ mod tests {
                 "cargo://indexmap@1.9.3",
                 CargoBuildRecipe {
                     rustc_cfgs: vec!["has_std".to_string()],
+                    ..Default::default()
                 },
             ),
             ("cargo://libc", CargoBuildRecipe::default()),
@@ -794,8 +854,11 @@ mod tests {
     fn test_cargo_rustls_build() {
         let mut e = Executor::with_config([
             (BuildConfigKey::TargetFamily, "unix".to_string()),
-            (BuildConfigKey::TargetOS, "linux".to_string()),
-            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+            (BuildConfigKey::TargetOS, "macos".to_string()),
+            (BuildConfigKey::TargetEnv, "".to_string()),
+            (BuildConfigKey::TargetArch, "aarch64".to_string()),
+            (BuildConfigKey::TargetVendor, "apple".to_string()),
+            (BuildConfigKey::TargetEndian, "little".to_string()),
         ]);
         e.builders
             .lock()
@@ -805,9 +868,23 @@ mod tests {
         let resolver = CargoResolver::new()
             .with_locked_dependencies([
                 (
+                    "cargo://getrandom",
+                    vec![("cfg_if", "cargo://cfg-if"), ("libc", "cargo://libc")],
+                ),
+                (
+                    "cargo://ring",
+                    vec![
+                        ("cfg_if", "cargo://cfg-if"),
+                        ("getrandom", "cargo://getrandom"),
+                        ("libc", "cargo://libc"),
+                        ("untrusted", "cargo://untrusted"),
+                    ],
+                ),
+                (
                     "cargo://rustls",
                     vec![
                         ("once_cell", "cargo://once_cell"),
+                        ("ring", "cargo://ring"),
                         ("pki_types", "cargo://rustls-pki-types"),
                         ("webpki", "cargo://rustls-webpki"),
                         ("subtle", "cargo://subtle"),
@@ -821,18 +898,33 @@ mod tests {
                 (
                     "cargo://rustls-webpki",
                     vec![
+                        ("ring", "cargo://ring"),
                         ("pki_types", "cargo://rustls-pki-types"),
                         ("untrusted", "cargo://untrusted"),
                     ],
                 ),
             ])
-            .with_build_recipes([("cargo://rustls", CargoBuildRecipe::default())]);
+            .with_build_recipes([
+                ("cargo://libc", CargoBuildRecipe::default()),
+                (
+                    "cargo://ring",
+                    CargoBuildRecipe {
+                        native_static_libs: vec![ring_native_static_lib()],
+                        ..Default::default()
+                    },
+                ),
+                ("cargo://rustls", CargoBuildRecipe::default()),
+            ]);
         e.context.lockfile = Arc::new(
             [
+                ("cargo://cfg-if", "1.0.4"),
+                ("cargo://getrandom", "0.2.17"),
+                ("cargo://libc", "0.2.186"),
                 ("cargo://once_cell", "1.21.4,alloc,race,std"),
-                ("cargo://rustls", "0.23.31,custom-provider,std"),
+                ("cargo://ring", "0.17.14,alloc,default,dev_urandom_fallback"),
+                ("cargo://rustls", "0.23.31,ring,std"),
                 ("cargo://rustls-pki-types", "1.14.1,alloc,default,std"),
-                ("cargo://rustls-webpki", "0.103.13,alloc,std"),
+                ("cargo://rustls-webpki", "0.103.13,alloc,ring,std"),
                 ("cargo://subtle", "2.6.1"),
                 ("cargo://untrusted", "0.9.0"),
                 ("cargo://zeroize", "1.8.2,alloc,default"),
@@ -884,6 +976,142 @@ mod tests {
         assert_eq!(
             output.outputs[0].file_name().and_then(|name| name.to_str()),
             Some("rustls_smoke")
+        );
+    }
+
+    #[test]
+    fn test_cargo_tokio_runtime_build() {
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
+        e.builders
+            .lock()
+            .unwrap()
+            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
+
+        let resolver = CargoResolver::new()
+            .with_locked_dependencies([
+                (
+                    "cargo://num_cpus",
+                    vec![
+                        ("hermit_abi", "cargo://hermit-abi"),
+                        ("libc", "cargo://libc"),
+                    ],
+                ),
+                (
+                    "cargo://proc-macro2",
+                    vec![("unicode_ident", "cargo://unicode-ident")],
+                ),
+                (
+                    "cargo://quote",
+                    vec![("proc_macro2", "cargo://proc-macro2")],
+                ),
+                (
+                    "cargo://syn",
+                    vec![
+                        ("proc_macro2", "cargo://proc-macro2"),
+                        ("quote", "cargo://quote"),
+                        ("unicode_ident", "cargo://unicode-ident"),
+                    ],
+                ),
+                (
+                    "cargo://tokio",
+                    vec![
+                        ("bytes", "cargo://bytes"),
+                        ("fnv", "cargo://fnv"),
+                        ("num_cpus", "cargo://num_cpus"),
+                        ("pin_project_lite", "cargo://pin-project-lite"),
+                        ("slab", "cargo://slab"),
+                        ("tokio_macros", "cargo://tokio-macros"),
+                    ],
+                ),
+                (
+                    "cargo://tokio-macros",
+                    vec![
+                        ("proc_macro2", "cargo://proc-macro2"),
+                        ("quote", "cargo://quote"),
+                        ("syn", "cargo://syn"),
+                    ],
+                ),
+            ])
+            .with_build_recipes([
+                ("cargo://libc", CargoBuildRecipe::default()),
+                ("cargo://proc-macro2", CargoBuildRecipe::default()),
+                ("cargo://quote", CargoBuildRecipe::default()),
+                ("cargo://slab", CargoBuildRecipe::default()),
+                ("cargo://syn", CargoBuildRecipe::default()),
+            ]);
+        e.context.lockfile = Arc::new(
+            [
+                ("cargo://bytes", "0.5.6,default,std"),
+                ("cargo://fnv", "1.0.7,default,std"),
+                ("cargo://hermit-abi", "0.5.2,default"),
+                ("cargo://libc", "0.2.186,default,std"),
+                ("cargo://num_cpus", "1.17.0"),
+                ("cargo://pin-project-lite", "0.1.12"),
+                ("cargo://proc-macro2", "1.0.106,default,proc-macro"),
+                ("cargo://quote", "1.0.45,default,proc-macro"),
+                ("cargo://slab", "0.4.12,default,std"),
+                (
+                    "cargo://syn",
+                    "1.0.109,clone-impls,default,derive,full,parsing,printing,proc-macro,quote",
+                ),
+                (
+                    "cargo://tokio",
+                    "0.2.25,default,fnv,macros,num_cpus,rt-core,rt-threaded,slab,sync,time,tokio-macros",
+                ),
+                ("cargo://tokio-macros", "0.2.6"),
+                ("cargo://unicode-ident", "1.0.24"),
+            ]
+            .into_iter()
+            .map(|(target, lockstring)| (target.to_string(), lockstring.to_string()))
+            .collect(),
+        );
+
+        e.resolvers.push(Box::new(resolver));
+        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
+            (
+                "@rust_compiler",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/Users/colinwm/.cargo/bin/rustc".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "@rust_plugin",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/tmp/rust.cdylib".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "//:tokio_runtime",
+                Ok(Config {
+                    build_plugin: "@rust_plugin".to_string(),
+                    sources: vec![
+                        "/Users/colinwm/Documents/code/cbs/data/tokio_runtime.rs".to_string()
+                    ],
+                    dependencies: vec!["cargo://tokio".to_string()],
+                    build_dependencies: vec!["@rust_compiler".to_string()],
+                    kind: plugin_kind::RUST_BINARY.to_string(),
+                    ..Default::default()
+                }),
+            ),
+        ])));
+
+        let id = e.add_task("//:tokio_runtime", None);
+        let result = e.run(&[id]);
+
+        let BuildResult::Success(output) = result else {
+            panic!("tokio runtime build failed");
+        };
+        assert_eq!(
+            output.outputs[0].file_name().and_then(|name| name.to_str()),
+            Some("tokio_runtime")
         );
     }
 }
