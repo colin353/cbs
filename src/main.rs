@@ -1,5 +1,6 @@
 mod actions;
 mod cargo;
+mod cargo_recipes;
 mod context;
 mod core;
 mod exec;

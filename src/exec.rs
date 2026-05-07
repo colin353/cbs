@@ -356,68 +356,9 @@ fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::{CargoBuildRecipe, CargoNativeStaticLib, CargoResolver};
+    use crate::cargo::CargoResolver;
 
     use crate::plugins::plugin_kind;
-
-    fn ring_native_static_lib() -> CargoNativeStaticLib {
-        CargoNativeStaticLib {
-            name: "ring_core_0_17_14_".to_string(),
-            sources: vec![
-                "crypto/curve25519/curve25519.c",
-                "crypto/fipsmodule/aes/aes_nohw.c",
-                "crypto/fipsmodule/bn/montgomery.c",
-                "crypto/fipsmodule/bn/montgomery_inv.c",
-                "crypto/fipsmodule/ec/ecp_nistz.c",
-                "crypto/fipsmodule/ec/gfp_p256.c",
-                "crypto/fipsmodule/ec/gfp_p384.c",
-                "crypto/fipsmodule/ec/p256.c",
-                "crypto/limbs/limbs.c",
-                "crypto/mem.c",
-                "crypto/poly1305/poly1305.c",
-                "crypto/fipsmodule/ec/p256-nistz.c",
-                "pregenerated/aesv8-armx-ios64.S",
-                "pregenerated/aesv8-gcm-armv8-ios64.S",
-                "pregenerated/ghash-neon-armv8-ios64.S",
-                "pregenerated/ghashv8-armx-ios64.S",
-                "pregenerated/p256-armv8-asm-ios64.S",
-                "pregenerated/sha256-armv8-ios64.S",
-                "pregenerated/sha512-armv8-ios64.S",
-                "pregenerated/chacha-armv8-ios64.S",
-                "pregenerated/chacha20_poly1305_armv8-ios64.S",
-                "pregenerated/armv8-mont-ios64.S",
-                "pregenerated/vpaes-armv8-ios64.S",
-            ]
-            .into_iter()
-            .map(|source| source.to_string())
-            .collect(),
-            include_dirs: vec!["include".to_string(), "pregenerated".to_string()],
-            flags: vec![
-                "-fvisibility=hidden",
-                "-std=c1x",
-                "-Wall",
-                "-Wbad-function-cast",
-                "-Wcast-align",
-                "-Wcast-qual",
-                "-Wconversion",
-                "-Wmissing-field-initializers",
-                "-Wmissing-include-dirs",
-                "-Wnested-externs",
-                "-Wredundant-decls",
-                "-Wshadow",
-                "-Wsign-compare",
-                "-Wsign-conversion",
-                "-Wstrict-prototypes",
-                "-Wundef",
-                "-Wuninitialized",
-                "-gfull",
-                "-DNDEBUG",
-            ]
-            .into_iter()
-            .map(|flag| flag.to_string())
-            .collect(),
-        }
-    }
 
     #[test]
     fn test_execution() {
@@ -518,10 +459,7 @@ mod tests {
             .collect(),
         );
 
-        e.resolvers.push(Box::new(
-            CargoResolver::new()
-                .with_build_recipes([("cargo://libc", CargoBuildRecipe::default())]),
-        ));
+        e.resolvers.push(Box::new(CargoResolver::new()));
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
                 "@rust_compiler",
@@ -584,10 +522,7 @@ mod tests {
                 .collect(),
         );
 
-        e.resolvers.push(Box::new(
-            CargoResolver::new()
-                .with_build_recipes([("cargo://libc", CargoBuildRecipe::default())]),
-        ));
+        e.resolvers.push(Box::new(CargoResolver::new()));
         e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
             (
                 "@rust_compiler",
@@ -635,20 +570,6 @@ mod tests {
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
         let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
-        let resolver = resolver.with_build_recipes([
-            ("cargo://httparse", CargoBuildRecipe::default()),
-            (
-                "cargo://indexmap@1.9.3",
-                CargoBuildRecipe {
-                    rustc_cfgs: vec!["has_std".to_string()],
-                    ..Default::default()
-                },
-            ),
-            ("cargo://libc", CargoBuildRecipe::default()),
-            ("cargo://proc-macro2", CargoBuildRecipe::default()),
-            ("cargo://slab", CargoBuildRecipe::default()),
-            ("cargo://syn@1.0.109", CargoBuildRecipe::default()),
-        ]);
         lockfile.extend(
             [
                 ("cargo://bytes@0.5.6", "0.5.6,default,std"),
@@ -781,10 +702,6 @@ mod tests {
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
         let (resolver, mut lockfile) = CargoResolver::from_cargo_lock("Cargo.lock").unwrap();
-        let resolver = resolver.with_build_recipes([
-            ("cargo://proc-macro2", CargoBuildRecipe::default()),
-            ("cargo://serde", CargoBuildRecipe::default()),
-        ]);
         lockfile.extend(
             [
                 ("cargo://proc-macro2", "1.0.71,default,proc-macro"),
@@ -865,56 +782,7 @@ mod tests {
             .unwrap()
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
-        let resolver = CargoResolver::new()
-            .with_locked_dependencies([
-                (
-                    "cargo://getrandom",
-                    vec![("cfg_if", "cargo://cfg-if"), ("libc", "cargo://libc")],
-                ),
-                (
-                    "cargo://ring",
-                    vec![
-                        ("cfg_if", "cargo://cfg-if"),
-                        ("getrandom", "cargo://getrandom"),
-                        ("libc", "cargo://libc"),
-                        ("untrusted", "cargo://untrusted"),
-                    ],
-                ),
-                (
-                    "cargo://rustls",
-                    vec![
-                        ("once_cell", "cargo://once_cell"),
-                        ("ring", "cargo://ring"),
-                        ("pki_types", "cargo://rustls-pki-types"),
-                        ("webpki", "cargo://rustls-webpki"),
-                        ("subtle", "cargo://subtle"),
-                        ("zeroize", "cargo://zeroize"),
-                    ],
-                ),
-                (
-                    "cargo://rustls-pki-types",
-                    vec![("zeroize", "cargo://zeroize")],
-                ),
-                (
-                    "cargo://rustls-webpki",
-                    vec![
-                        ("ring", "cargo://ring"),
-                        ("pki_types", "cargo://rustls-pki-types"),
-                        ("untrusted", "cargo://untrusted"),
-                    ],
-                ),
-            ])
-            .with_build_recipes([
-                ("cargo://libc", CargoBuildRecipe::default()),
-                (
-                    "cargo://ring",
-                    CargoBuildRecipe {
-                        native_static_libs: vec![ring_native_static_lib()],
-                        ..Default::default()
-                    },
-                ),
-                ("cargo://rustls", CargoBuildRecipe::default()),
-            ]);
+        let resolver = CargoResolver::new();
         e.context.lockfile = Arc::new(
             [
                 ("cargo://cfg-if", "1.0.4"),
@@ -991,58 +859,7 @@ mod tests {
             .unwrap()
             .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
 
-        let resolver = CargoResolver::new()
-            .with_locked_dependencies([
-                (
-                    "cargo://num_cpus",
-                    vec![
-                        ("hermit_abi", "cargo://hermit-abi"),
-                        ("libc", "cargo://libc"),
-                    ],
-                ),
-                (
-                    "cargo://proc-macro2",
-                    vec![("unicode_ident", "cargo://unicode-ident")],
-                ),
-                (
-                    "cargo://quote",
-                    vec![("proc_macro2", "cargo://proc-macro2")],
-                ),
-                (
-                    "cargo://syn",
-                    vec![
-                        ("proc_macro2", "cargo://proc-macro2"),
-                        ("quote", "cargo://quote"),
-                        ("unicode_ident", "cargo://unicode-ident"),
-                    ],
-                ),
-                (
-                    "cargo://tokio",
-                    vec![
-                        ("bytes", "cargo://bytes"),
-                        ("fnv", "cargo://fnv"),
-                        ("num_cpus", "cargo://num_cpus"),
-                        ("pin_project_lite", "cargo://pin-project-lite"),
-                        ("slab", "cargo://slab"),
-                        ("tokio_macros", "cargo://tokio-macros"),
-                    ],
-                ),
-                (
-                    "cargo://tokio-macros",
-                    vec![
-                        ("proc_macro2", "cargo://proc-macro2"),
-                        ("quote", "cargo://quote"),
-                        ("syn", "cargo://syn"),
-                    ],
-                ),
-            ])
-            .with_build_recipes([
-                ("cargo://libc", CargoBuildRecipe::default()),
-                ("cargo://proc-macro2", CargoBuildRecipe::default()),
-                ("cargo://quote", CargoBuildRecipe::default()),
-                ("cargo://slab", CargoBuildRecipe::default()),
-                ("cargo://syn", CargoBuildRecipe::default()),
-            ]);
+        let resolver = CargoResolver::new();
         e.context.lockfile = Arc::new(
             [
                 ("cargo://bytes", "0.5.6,default,std"),

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::cargo_recipes;
 use crate::core::{config_extra_keys, BuildConfigKey, Config, Context, ResolverPlugin};
 use crate::plugins::plugin_kind;
 
@@ -31,6 +32,7 @@ impl CargoResolver {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_build_recipes<I, S>(mut self, recipes: I) -> Self
     where
         I: IntoIterator<Item = (S, CargoBuildRecipe)>,
@@ -44,6 +46,7 @@ impl CargoResolver {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_locked_dependencies<I, S, J, K, V>(mut self, dependencies: I) -> Self
     where
         I: IntoIterator<Item = (S, J)>,
@@ -62,6 +65,20 @@ impl CargoResolver {
                 )
             }));
         self
+    }
+
+    fn build_recipe(
+        &self,
+        context: &Context,
+        target: &str,
+        package: &str,
+        version: &str,
+    ) -> Option<CargoBuildRecipe> {
+        self.build_recipes
+            .get(target)
+            .or_else(|| self.build_recipes.get(&format!("cargo://{package}")))
+            .cloned()
+            .or_else(|| cargo_recipes::build_recipe(context, package, version))
     }
 
     pub fn from_cargo_lock<P: AsRef<std::path::Path>>(
@@ -835,18 +852,15 @@ impl ResolverPlugin for CargoResolver {
         get_rust_files(&dest.join("src"), &mut rust_files)?;
 
         let toml = parse_cargo_toml(&context, &dest.join("Cargo.toml"), &features)?;
-        let build_recipe = if toml.has_build_script {
-            Some(self.build_recipes.get(target).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{target} declares build.rs, but no hermetic Cargo build recipe was provided"
-                    ),
-                )
-            })?)
-        } else {
-            None
-        };
+        let build_recipe = self.build_recipe(&context, target, crate_name, crate_version);
+        if toml.has_build_script && build_recipe.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{target} declares build.rs, but no hermetic Cargo build recipe was provided"
+                ),
+            ));
+        }
 
         let mut deps = Vec::new();
         let mut dependency_aliases = Vec::new();
@@ -878,12 +892,14 @@ impl ResolverPlugin for CargoResolver {
         extras.insert(
             config_extra_keys::RUSTC_CFGS,
             build_recipe
+                .as_ref()
                 .map(|recipe| recipe.rustc_cfgs.clone())
                 .unwrap_or_default(),
         );
         extras.insert(
             config_extra_keys::NATIVE_STATIC_LIBS,
             build_recipe
+                .as_ref()
                 .map(|recipe| {
                     recipe
                         .native_static_libs
