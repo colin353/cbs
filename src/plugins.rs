@@ -54,9 +54,9 @@ impl RustPlugin {
             .map(|hash| format!("{hash:x}"))
             .unwrap_or_else(|| config.hash.to_string());
         let out_file = if crate_type == "proc-macro" {
-            working_directory.join(format!("lib{name}-{metadata}.{}", dylib_extension()))
+            working_directory.join(format!("lib{crate_name}-{metadata}.{}", dylib_extension()))
         } else {
-            working_directory.join(format!("lib{name}-{metadata}.rlib"))
+            working_directory.join(format!("lib{crate_name}-{metadata}.rlib"))
         };
 
         let root_source: String = match config.get(config_extra_keys::ROOT_SOURCE).first() {

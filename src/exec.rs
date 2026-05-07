@@ -789,4 +789,101 @@ mod tests {
             Some("serde_derive_smoke")
         );
     }
+
+    #[test]
+    fn test_cargo_rustls_build() {
+        let mut e = Executor::with_config([
+            (BuildConfigKey::TargetFamily, "unix".to_string()),
+            (BuildConfigKey::TargetOS, "linux".to_string()),
+            (BuildConfigKey::TargetEnv, "gnu".to_string()),
+        ]);
+        e.builders
+            .lock()
+            .unwrap()
+            .insert("@filesystem".to_string(), Arc::new(FilesystemBuilder {}));
+
+        let resolver = CargoResolver::new()
+            .with_locked_dependencies([
+                (
+                    "cargo://rustls",
+                    vec![
+                        ("once_cell", "cargo://once_cell"),
+                        ("pki_types", "cargo://rustls-pki-types"),
+                        ("webpki", "cargo://rustls-webpki"),
+                        ("subtle", "cargo://subtle"),
+                        ("zeroize", "cargo://zeroize"),
+                    ],
+                ),
+                (
+                    "cargo://rustls-pki-types",
+                    vec![("zeroize", "cargo://zeroize")],
+                ),
+                (
+                    "cargo://rustls-webpki",
+                    vec![
+                        ("pki_types", "cargo://rustls-pki-types"),
+                        ("untrusted", "cargo://untrusted"),
+                    ],
+                ),
+            ])
+            .with_build_recipes([("cargo://rustls", CargoBuildRecipe::default())]);
+        e.context.lockfile = Arc::new(
+            [
+                ("cargo://once_cell", "1.21.4,alloc,race,std"),
+                ("cargo://rustls", "0.23.31,custom-provider,std"),
+                ("cargo://rustls-pki-types", "1.14.1,alloc,default,std"),
+                ("cargo://rustls-webpki", "0.103.13,alloc,std"),
+                ("cargo://subtle", "2.6.1"),
+                ("cargo://untrusted", "0.9.0"),
+                ("cargo://zeroize", "1.8.2,alloc,default"),
+            ]
+            .into_iter()
+            .map(|(target, lockstring)| (target.to_string(), lockstring.to_string()))
+            .collect(),
+        );
+
+        e.resolvers.push(Box::new(resolver));
+        e.resolvers.push(Box::new(FakeResolver::with_configs(vec![
+            (
+                "@rust_compiler",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/Users/colinwm/.cargo/bin/rustc".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "@rust_plugin",
+                Ok(Config {
+                    build_plugin: "@filesystem".to_string(),
+                    location: Some("/tmp/rust.cdylib".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "//:rustls_smoke",
+                Ok(Config {
+                    build_plugin: "@rust_plugin".to_string(),
+                    sources: vec![
+                        "/Users/colinwm/Documents/code/cbs/data/rustls_smoke.rs".to_string()
+                    ],
+                    dependencies: vec!["cargo://rustls".to_string()],
+                    build_dependencies: vec!["@rust_compiler".to_string()],
+                    kind: plugin_kind::RUST_BINARY.to_string(),
+                    ..Default::default()
+                }),
+            ),
+        ])));
+
+        let id = e.add_task("//:rustls_smoke", None);
+        let result = e.run(&[id]);
+
+        let BuildResult::Success(output) = result else {
+            panic!("rustls build failed");
+        };
+        assert_eq!(
+            output.outputs[0].file_name().and_then(|name| name.to_str()),
+            Some("rustls_smoke")
+        );
+    }
 }

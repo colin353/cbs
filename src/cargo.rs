@@ -35,6 +35,26 @@ impl CargoResolver {
         self
     }
 
+    pub fn with_locked_dependencies<I, S, J, K, V>(mut self, dependencies: I) -> Self
+    where
+        I: IntoIterator<Item = (S, J)>,
+        S: Into<String>,
+        J: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.locked_dependencies
+            .extend(dependencies.into_iter().map(|(target, deps)| {
+                (
+                    target.into(),
+                    deps.into_iter()
+                        .map(|(package, target)| (package.into(), target.into()))
+                        .collect(),
+                )
+            }));
+        self
+    }
+
     pub fn from_cargo_lock<P: AsRef<std::path::Path>>(
         lockfile: P,
     ) -> std::io::Result<(Self, HashMap<String, String>)> {
