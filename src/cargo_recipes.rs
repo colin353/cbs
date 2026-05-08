@@ -3,7 +3,8 @@ use crate::core::{BuildConfigKey, Context};
 
 pub fn build_recipe(context: &Context, package: &str, version: &str) -> Option<CargoBuildRecipe> {
     match (package, version) {
-        ("httparse", "1.8.0")
+        ("flatbuffers", "25.12.19")
+        | ("httparse", "1.8.0")
         | ("httparse", "1.10.1")
         | ("libc", "0.2.151")
         | ("libc", "0.2.186")

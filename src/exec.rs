@@ -695,13 +695,54 @@ impl TaskGraph {
 }
 
 fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
-    if let Some(f) = path.file_name() {
-        if f == "rust.cdylib" {
-            return Arc::new(crate::plugins::RustPlugin {});
-        }
+    if path.exists() {
+        return match crate::plugin_abi::load_build_plugin(path) {
+            Ok(plugin) => Arc::new(plugin),
+            Err(e) => Arc::new(PluginLoadFailure {
+                message: e.to_string(),
+            }),
+        };
     }
 
-    Arc::new(FakeBuilder {})
+    #[cfg(test)]
+    if let Some(plugin) = load_test_builtin_plugin(path) {
+        return plugin;
+    }
+
+    Arc::new(PluginLoadFailure {
+        message: format!("plugin path {} does not exist", path.display()),
+    })
+}
+
+#[cfg(test)]
+fn load_test_builtin_plugin(path: &std::path::Path) -> Option<Arc<dyn BuildPlugin>> {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("rust.cdylib") => Some(Arc::new(
+            crate::plugin_abi::AbiBuildPlugin::new(crate::rust_plugin::cbs_plugin_v1())
+                .expect("builtin rust plugin must use the current ABI"),
+        )),
+        Some("bus.cdylib") => Some(Arc::new(
+            crate::plugin_abi::AbiBuildPlugin::new(crate::bus::cbs_plugin_v1())
+                .expect("builtin bus plugin must use the current ABI"),
+        )),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct PluginLoadFailure {
+    message: String,
+}
+
+impl BuildPlugin for PluginLoadFailure {
+    fn build(
+        &self,
+        _context: Context,
+        _task: Task,
+        _dependencies: HashMap<String, BuildOutput>,
+    ) -> BuildResult {
+        BuildResult::Failure(format!("failed to load build plugin: {}", self.message))
+    }
 }
 
 #[cfg(test)]

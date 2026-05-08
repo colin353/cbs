@@ -1,6 +1,7 @@
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
@@ -88,7 +89,7 @@ impl BuildResult {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub dependencies: Vec<String>,
     pub external_requirements: Vec<ExternalRequirement>,
@@ -136,6 +137,13 @@ pub mod config_extra_keys {
     pub const CRATE_ROOT: u32 = 7;
     pub const NATIVE_STATIC_LIBS: u32 = 8;
     pub const RUSTC_ENV: u32 = 9;
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleContext {
+    pub workspace_root: PathBuf,
+    pub package: String,
+    pub package_dir: PathBuf,
 }
 
 impl Config {
@@ -283,6 +291,17 @@ pub trait DependencyPlannerPlugin: std::fmt::Debug + Send + Sync {
         context: Context,
         requirements: &[ExternalRequirement],
     ) -> std::io::Result<DependencyPlan>;
+}
+
+pub trait RulePlugin: std::fmt::Debug + Send + Sync {
+    fn rule_kinds(&self) -> Vec<&str>;
+
+    fn config_from_target(
+        &self,
+        context: &RuleContext,
+        kind: &str,
+        target: &toml::Table,
+    ) -> std::io::Result<Config>;
 }
 
 pub trait BuildPlugin: std::fmt::Debug + Send + Sync {

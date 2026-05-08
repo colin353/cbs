@@ -1,0 +1,88 @@
+namespace cbs.plugin_abi.v1;
+
+table StringList {
+  values: [string];
+}
+
+table Extra {
+  key: uint;
+  values: [string];
+}
+
+table StringField {
+  key: string;
+  value: string;
+}
+
+table PluginManifest {
+  name: string;
+  rule_kinds: [string];
+  build_plugins: [string];
+  label_fields: [string];
+  test_rule_kinds: [string];
+}
+
+table ExternalRequirement {
+  ecosystem: string;
+  package: string;
+  version: string;
+  features: [string];
+  default_features: bool;
+  target: string;
+}
+
+table Config {
+  dependencies: [string];
+  external_requirements: [ExternalRequirement];
+  build_plugin: string;
+  location: string;
+  sources: [string];
+  build_dependencies: [string];
+  kind: string;
+  extras: [Extra];
+}
+
+table BuildOutput {
+  outputs: [string];
+  extras: [Extra];
+}
+
+table DependencyOutput {
+  target: string;
+  output: BuildOutput;
+}
+
+table BuildRequest {
+  target: string;
+  config: Config;
+  dependencies: [DependencyOutput];
+  working_directory: string;
+}
+
+table BuildResponse {
+  success: bool;
+  error: string;
+  output: BuildOutput;
+  delegate_config: Config;
+}
+
+table ParseRuleRequest {
+  workspace_root: string;
+  package: string;
+  package_dir: string;
+  kind: string;
+  name: string;
+  sources: [string];
+  dependencies: [string];
+  cargo_requirements: [ExternalRequirement];
+  string_fields: [StringField];
+  label_fields: [StringField];
+}
+
+table ParseRuleResponse {
+  success: bool;
+  error: string;
+  config: Config;
+}
+
+root_type BuildRequest;

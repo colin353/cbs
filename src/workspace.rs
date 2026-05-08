@@ -1,14 +1,17 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cargo::{CargoDependencyPlanner, CargoResolver};
 use crate::core::{
-    config_extra_keys, BuildConfigKey, BuildResult, Config, Context, ExternalRequirement,
-    FakeResolver, FilesystemBuilder, ResolverPlugin,
+    BuildConfigKey, BuildResult, Config, Context, ExternalRequirement, FakeResolver,
+    FilesystemBuilder, ResolverPlugin, RuleContext, RulePlugin,
 };
 use crate::exec::Executor;
-use crate::plugins::plugin_kind;
+use crate::plugin_abi::{load_dynamic_plugin, AbiRulePlugin, LoadedAbiPlugin};
+
+#[cfg(test)]
+use crate::plugin_abi::loaded_builtin_plugin;
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -17,17 +20,30 @@ pub struct Workspace {
     config: WorkspaceConfig,
 }
 
+pub struct BuildInvocationResult {
+    pub targets: Vec<String>,
+    pub result: BuildResult,
+}
+
 #[derive(Debug, Clone)]
 struct WorkspaceConfig {
     cache_dir: PathBuf,
     rustc: String,
     target_config: Vec<(BuildConfigKey, String)>,
+    plugins: Vec<WorkspacePluginConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePluginConfig {
+    name: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceResolver {
     root: PathBuf,
     current_package: String,
+    rule_plugins: Arc<Vec<Arc<dyn RulePlugin>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +70,7 @@ impl Workspace {
         })
     }
 
-    pub fn executor(&self) -> Executor {
+    pub fn executor(&self) -> std::io::Result<Executor> {
         let mut context = Context::new(
             self.config.cache_dir.clone(),
             self.config.target_config.clone(),
@@ -62,13 +78,16 @@ impl Workspace {
         context.calculate_hash();
 
         let mut executor = Executor::with_context(context);
+        let loaded_plugins = self.load_workspace_plugins()?;
+        let rule_plugins = rule_plugins(&loaded_plugins)?;
         executor.add_builder_plugin("@filesystem", Arc::new(FilesystemBuilder {}));
         executor.add_resolver_plugin(Box::new(WorkspaceResolver {
             root: self.root.clone(),
             current_package: self.current_package.clone(),
+            rule_plugins,
         }));
         executor.add_resolver_plugin(Box::new(CargoResolver::new()));
-        executor.add_resolver_plugin(Box::new(FakeResolver::with_configs(vec![
+        let mut tool_configs = vec![
             (
                 "@rust_compiler",
                 Ok(Config {
@@ -85,10 +104,282 @@ impl Workspace {
                     ..Default::default()
                 }),
             ),
-        ])));
+        ];
+        for loaded in &loaded_plugins {
+            for build_plugin in &loaded.manifest.build_plugins {
+                tool_configs.push((
+                    build_plugin.as_str(),
+                    Ok(Config {
+                        build_plugin: "@filesystem".to_string(),
+                        location: Some(loaded.path.to_string_lossy().to_string()),
+                        ..Default::default()
+                    }),
+                ));
+            }
+        }
+        executor.add_resolver_plugin(Box::new(FakeResolver::with_configs(tool_configs)));
         executor.add_dependency_planner_plugin(Box::new(CargoDependencyPlanner::new()));
-        executor
+        Ok(executor)
     }
+
+    pub fn expand_target_patterns(&self, targets: &[String]) -> std::io::Result<Vec<String>> {
+        let rule_kinds = self.rule_kinds()?;
+        let mut expanded = Vec::new();
+        let mut seen = HashSet::new();
+        for target in targets {
+            for label in self.expand_target_pattern(target, &rule_kinds)? {
+                if seen.insert(label.clone()) {
+                    expanded.push(label);
+                }
+            }
+        }
+        Ok(expanded)
+    }
+
+    pub fn expand_test_patterns(&self, targets: &[String]) -> std::io::Result<Vec<String>> {
+        let all_rule_kinds = self.rule_kinds()?;
+        let test_rule_kinds = self.test_rule_kinds()?;
+        let mut expanded = Vec::new();
+        let mut seen = HashSet::new();
+        for target in targets {
+            for label in self.expand_test_pattern(target, &all_rule_kinds, &test_rule_kinds)? {
+                if seen.insert(label.clone()) {
+                    expanded.push(label);
+                }
+            }
+        }
+        Ok(expanded)
+    }
+
+    fn expand_target_pattern(
+        &self,
+        target: &str,
+        rule_kinds: &[String],
+    ) -> std::io::Result<Vec<String>> {
+        if let Some(package) = recursive_package_pattern(target)? {
+            return self.expand_recursive_package(&package, rule_kinds);
+        }
+        parse_label(target, &self.current_package).map(|label| vec![canonical_label(&label)])
+    }
+
+    fn expand_recursive_package(
+        &self,
+        package: &str,
+        rule_kinds: &[String],
+    ) -> std::io::Result<Vec<String>> {
+        let package_dir = self.root.join(package);
+        validate_workspace_relative(&self.root, &package_dir)?;
+        if !package_dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("target pattern //{package}/... refers to a missing package directory"),
+            ));
+        }
+
+        let mut labels = Vec::new();
+        collect_package_targets(&self.root, &package_dir, rule_kinds, &mut labels)?;
+        if labels.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("target pattern //{package}/... did not match any targets"),
+            ));
+        }
+        labels.sort();
+        Ok(labels)
+    }
+
+    fn expand_test_pattern(
+        &self,
+        target: &str,
+        all_rule_kinds: &[String],
+        test_rule_kinds: &[String],
+    ) -> std::io::Result<Vec<String>> {
+        if let Some(package) = recursive_package_pattern(target)? {
+            let package_dir = self.root.join(&package);
+            validate_workspace_relative(&self.root, &package_dir)?;
+            if !package_dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("target pattern //{package}/... refers to a missing package directory"),
+                ));
+            }
+
+            let mut labels = Vec::new();
+            collect_package_targets(&self.root, &package_dir, test_rule_kinds, &mut labels)?;
+            labels.sort();
+            return Ok(labels);
+        }
+
+        let label = parse_label(target, &self.current_package)?;
+        match self.label_rule_kind(&label, all_rule_kinds)? {
+            Some(kind) if test_rule_kinds.iter().any(|test_kind| test_kind == &kind) => {
+                Ok(vec![canonical_label(&label)])
+            }
+            Some(_) => Ok(Vec::new()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("target {target} not found"),
+            )),
+        }
+    }
+
+    fn label_rule_kind(
+        &self,
+        label: &Label,
+        rule_kinds: &[String],
+    ) -> std::io::Result<Option<String>> {
+        let package_dir = self.root.join(&label.package);
+        validate_workspace_relative(&self.root, &package_dir)?;
+        let build_file = package_dir.join("BUILD.toml");
+        if !build_file.exists() {
+            return Ok(None);
+        }
+        let table = std::fs::read_to_string(&build_file)?
+            .parse::<toml::Table>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        for kind in rule_kinds {
+            if find_named_target(&table, kind, &label.name)?.is_some() {
+                return Ok(Some(kind.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn rule_kinds(&self) -> std::io::Result<Vec<String>> {
+        let mut kinds = Vec::new();
+        for loaded in self.load_workspace_plugins()? {
+            kinds.extend(loaded.manifest.rule_kinds.clone());
+        }
+        kinds.sort();
+        kinds.dedup();
+        Ok(kinds)
+    }
+
+    fn test_rule_kinds(&self) -> std::io::Result<Vec<String>> {
+        let mut kinds = Vec::new();
+        for loaded in self.load_workspace_plugins()? {
+            kinds.extend(loaded.manifest.test_rule_kinds.clone());
+        }
+        kinds.sort();
+        kinds.dedup();
+        Ok(kinds)
+    }
+
+    fn load_workspace_plugins(&self) -> std::io::Result<Vec<LoadedWorkspacePlugin>> {
+        let mut plugins = vec![self.load_implicit_rust_plugin()?];
+        plugins.extend(
+            self.config
+                .plugins
+                .iter()
+                .map(|plugin| {
+                    let loaded = load_workspace_dynamic_or_test_plugin(&plugin.path, &plugin.name)
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "failed to load workspace plugin {} at {}: {e}",
+                                    plugin.name,
+                                    plugin.path.display()
+                                ),
+                            )
+                        })?;
+                    if loaded.manifest.name != plugin.name {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "workspace plugin {} loaded manifest for {}",
+                                plugin.name, loaded.manifest.name
+                            ),
+                        ));
+                    }
+                    Ok(LoadedWorkspacePlugin {
+                        path: plugin.path.clone(),
+                        loaded,
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        Ok(plugins)
+    }
+
+    fn load_implicit_rust_plugin(&self) -> std::io::Result<LoadedWorkspacePlugin> {
+        let path = PathBuf::from("/tmp/rust.cdylib");
+        let loaded = load_workspace_dynamic_or_test_plugin(&path, "rust")?;
+        if loaded.manifest.name != "rust" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "rust plugin path loaded manifest for {}",
+                    loaded.manifest.name
+                ),
+            ));
+        }
+        Ok(LoadedWorkspacePlugin { path, loaded })
+    }
+}
+
+#[cfg(not(test))]
+fn load_workspace_dynamic_or_test_plugin(
+    path: &Path,
+    _name: &str,
+) -> std::io::Result<LoadedAbiPlugin> {
+    load_dynamic_plugin(path)
+}
+
+#[cfg(test)]
+fn load_workspace_dynamic_or_test_plugin(
+    path: &Path,
+    name: &str,
+) -> std::io::Result<LoadedAbiPlugin> {
+    if path.exists() {
+        return load_dynamic_plugin(path);
+    }
+
+    match name {
+        "rust" => loaded_builtin_plugin(crate::rust_plugin::cbs_plugin_v1()),
+        "bus" => loaded_builtin_plugin(crate::bus::cbs_plugin_v1()),
+        _ => load_dynamic_plugin(path),
+    }
+}
+
+#[derive(Debug)]
+struct LoadedWorkspacePlugin {
+    path: PathBuf,
+    loaded: LoadedAbiPlugin,
+}
+
+impl std::ops::Deref for LoadedWorkspacePlugin {
+    type Target = LoadedAbiPlugin;
+
+    fn deref(&self) -> &Self::Target {
+        &self.loaded
+    }
+}
+
+fn rule_plugins(
+    loaded_plugins: &[LoadedWorkspacePlugin],
+) -> std::io::Result<Arc<Vec<Arc<dyn RulePlugin>>>> {
+    let mut plugins: Vec<Arc<dyn RulePlugin>> = Vec::new();
+    for loaded in loaded_plugins {
+        if loaded.manifest.rule_kinds.is_empty() {
+            continue;
+        }
+        let rule_plugin = match loaded.library.as_ref() {
+            Some(library) => AbiRulePlugin::with_library(
+                loaded.plugin,
+                loaded.manifest.rule_kinds.clone(),
+                loaded.manifest.label_fields.clone(),
+                library.clone(),
+            )?,
+            None => AbiRulePlugin::new(
+                loaded.plugin,
+                loaded.manifest.rule_kinds.clone(),
+                loaded.manifest.label_fields.clone(),
+            )?,
+        };
+        plugins.push(Arc::new(rule_plugin));
+    }
+    Ok(Arc::new(plugins))
 }
 
 impl ResolverPlugin for WorkspaceResolver {
@@ -105,18 +396,16 @@ impl ResolverPlugin for WorkspaceResolver {
             .parse::<toml::Table>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        for (section, kind) in [
-            ("rust_binary", plugin_kind::RUST_BINARY),
-            ("rust_library", plugin_kind::RUST_LIBRARY),
-        ] {
-            if let Some(target_table) = find_named_target(&table, section, &label.name)? {
-                return config_from_target(
-                    &self.root,
-                    &label.package,
-                    &package_dir,
-                    kind,
-                    target_table,
-                );
+        let rule_context = RuleContext {
+            workspace_root: self.root.clone(),
+            package: label.package.clone(),
+            package_dir: package_dir.clone(),
+        };
+        for plugin in self.rule_plugins.iter() {
+            for kind in plugin.rule_kinds() {
+                if let Some(target_table) = find_named_target(&table, kind, &label.name)? {
+                    return plugin.config_from_target(&rule_context, kind, target_table);
+                }
             }
         }
 
@@ -127,49 +416,101 @@ impl ResolverPlugin for WorkspaceResolver {
     }
 }
 
-pub fn build_from_current_workspace(target: &str) -> std::io::Result<BuildResult> {
-    let cwd = std::env::current_dir()?;
-    let workspace = Workspace::load_from(&cwd)?;
-    let mut executor = workspace.executor();
-    let root = executor.add_task(target, None);
-    Ok(executor.run(&[root]))
+pub fn build_from_current_workspace(targets: &[String]) -> std::io::Result<BuildResult> {
+    Ok(build_targets_from_current_workspace(targets)?.result)
 }
 
-fn config_from_target(
-    root: &Path,
-    package: &str,
-    package_dir: &Path,
-    kind: &str,
-    target: &toml::Table,
-) -> std::io::Result<Config> {
-    let sources = string_list(target, "srcs")?
-        .into_iter()
-        .map(|src| package_path(root, package_dir, &src))
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|path| path.to_string_lossy().to_string())
+pub fn build_targets_from_current_workspace(
+    targets: &[String],
+) -> std::io::Result<BuildInvocationResult> {
+    let cwd = std::env::current_dir()?;
+    let workspace = Workspace::load_from(&cwd)?;
+    let targets = workspace.expand_target_patterns(targets)?;
+    eprintln!("[cbs] expanded to {} target(s)", targets.len());
+    let mut executor = workspace.executor()?;
+    let roots: Vec<_> = targets
+        .iter()
+        .map(|target| executor.add_task(target, None))
         .collect();
-    let dependencies = string_list(target, "deps")?
-        .into_iter()
-        .map(|dep| parse_label(&dep, package).map(|label| canonical_label(&label)))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let external_requirements = cargo_requirements(target, package)?;
+    Ok(BuildInvocationResult {
+        targets,
+        result: executor.run(&roots),
+    })
+}
 
-    let mut extras = HashMap::new();
-    if let Some(edition) = target.get("edition").and_then(|value| value.as_str()) {
-        extras.insert(config_extra_keys::EDITION, vec![edition.to_string()]);
+pub fn build_tests_from_current_workspace(
+    targets: &[String],
+) -> std::io::Result<BuildInvocationResult> {
+    let cwd = std::env::current_dir()?;
+    let workspace = Workspace::load_from(&cwd)?;
+    let targets = workspace.expand_test_patterns(targets)?;
+    eprintln!("[cbs] expanded to {} test target(s)", targets.len());
+    let mut executor = workspace.executor()?;
+    let roots: Vec<_> = targets
+        .iter()
+        .map(|target| executor.add_task(target, None))
+        .collect();
+    Ok(BuildInvocationResult {
+        targets,
+        result: executor.run(&roots),
+    })
+}
+
+impl RuleContext {
+    pub fn source_paths(&self, target: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
+        string_list(target, key)?
+            .into_iter()
+            .map(|src| package_path(&self.workspace_root, &self.package_dir, &src))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|path| Ok(path.to_string_lossy().to_string()))
+            .collect()
     }
 
-    Ok(Config {
-        dependencies,
-        external_requirements,
-        build_plugin: "@rust_plugin".to_string(),
-        sources,
-        build_dependencies: vec!["@rust_compiler".to_string()],
-        kind: kind.to_string(),
-        extras,
-        ..Default::default()
-    })
+    pub fn optional_source_path(
+        &self,
+        target: &toml::Table,
+        key: &str,
+    ) -> std::io::Result<Option<String>> {
+        target
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|src| {
+                package_path(&self.workspace_root, &self.package_dir, src)
+                    .map(|path| path.to_string_lossy().to_string())
+            })
+            .transpose()
+    }
+
+    pub fn label_list(&self, target: &toml::Table, key: &str) -> std::io::Result<Vec<String>> {
+        string_list(target, key)?
+            .into_iter()
+            .map(|dep| parse_label(&dep, &self.package).map(|label| canonical_label(&label)))
+            .collect()
+    }
+
+    pub fn optional_label(
+        &self,
+        target: &toml::Table,
+        key: &str,
+    ) -> std::io::Result<Option<String>> {
+        target
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|value| parse_label(value, &self.package).map(|label| canonical_label(&label)))
+            .transpose()
+    }
+
+    pub fn cargo_requirements(
+        &self,
+        target: &toml::Table,
+    ) -> std::io::Result<Vec<ExternalRequirement>> {
+        cargo_requirements(target, &self.package)
+    }
+
+    pub fn required_string(&self, target: &toml::Table, key: &str) -> std::io::Result<String> {
+        required_string(target, key)
+    }
 }
 
 fn cargo_requirements(
@@ -244,6 +585,88 @@ fn find_named_target<'a>(
     Ok(None)
 }
 
+fn collect_package_targets(
+    root: &Path,
+    dir: &Path,
+    rule_kinds: &[String],
+    labels: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let build_file = dir.join("BUILD.toml");
+    if build_file.exists() {
+        let package = dir
+            .strip_prefix(root)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is not inside workspace {}",
+                        dir.display(),
+                        root.display()
+                    ),
+                )
+            })?
+            .to_string_lossy()
+            .trim_matches('/')
+            .to_string();
+        let table = std::fs::read_to_string(&build_file)?
+            .parse::<toml::Table>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        for kind in rule_kinds {
+            for target in target_tables(&table, kind)? {
+                let name = required_string(target, "name")?;
+                labels.push(canonical_label(&Label {
+                    package: package.clone(),
+                    name,
+                }));
+            }
+        }
+    }
+
+    let mut children: Vec<_> = std::fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| path.is_dir() && !is_hidden_path(path))
+        .collect();
+    children.sort();
+    for child in children {
+        collect_package_targets(root, &child, rule_kinds, labels)?;
+    }
+    Ok(())
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn target_tables<'a>(
+    table: &'a toml::Table,
+    section: &str,
+) -> std::io::Result<Vec<&'a toml::Table>> {
+    let Some(value) = table.get(section) else {
+        return Ok(Vec::new());
+    };
+    let targets = value.as_array().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{section} must be an array of tables"),
+        )
+    })?;
+    targets
+        .iter()
+        .map(|target| {
+            target.as_table().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{section} entries must be tables"),
+                )
+            })
+        })
+        .collect()
+}
+
 fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<WorkspaceConfig> {
     let table = std::fs::read_to_string(workspace_file)?
         .parse::<toml::Table>()
@@ -269,7 +692,38 @@ fn load_workspace_config(root: &Path, workspace_file: &Path) -> std::io::Result<
         cache_dir,
         rustc,
         target_config: target_config(&table),
+        plugins: workspace_plugins(root, &table)?,
     })
+}
+
+fn workspace_plugins(
+    root: &Path,
+    table: &toml::Table,
+) -> std::io::Result<Vec<WorkspacePluginConfig>> {
+    let Some(value) = table.get("plugins") else {
+        return Ok(Vec::new());
+    };
+    let plugins = value.as_array().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugins must be an array of tables",
+        )
+    })?;
+    plugins
+        .iter()
+        .map(|plugin| {
+            let plugin = plugin.as_table().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "plugins entries must be tables",
+                )
+            })?;
+            Ok(WorkspacePluginConfig {
+                name: required_string(plugin, "name")?,
+                path: root_relative_path(root, &required_string(plugin, "path")?),
+            })
+        })
+        .collect()
 }
 
 fn target_config(table: &toml::Table) -> Vec<(BuildConfigKey, String)> {
@@ -345,6 +799,27 @@ fn parse_label(value: &str, current_package: &str) -> std::io::Result<Label> {
         package: package.trim_matches('/').to_string(),
         name: name.to_string(),
     })
+}
+
+fn recursive_package_pattern(value: &str) -> std::io::Result<Option<String>> {
+    let Some(rest) = value.strip_prefix("//") else {
+        return Ok(None);
+    };
+    let package = if rest == "..." {
+        ""
+    } else {
+        let Some(package) = rest.strip_suffix("/...") else {
+            return Ok(None);
+        };
+        package
+    };
+    if package.contains(':')
+        || package.split('/').any(|part| part == "..")
+        || package.starts_with('/')
+    {
+        return Err(invalid_label(value));
+    }
+    Ok(Some(package.trim_matches('/').to_string()))
 }
 
 fn canonical_label(label: &Label) -> String {
@@ -477,6 +952,15 @@ fn root_relative(root: &Path, path: &str) -> String {
     }
 }
 
+fn root_relative_path(root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
 fn invalid_label(label: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -499,7 +983,7 @@ mod tests {
             );
 
             let workspace = Workspace::load_from(&workspace_root).unwrap();
-            let mut executor = workspace.executor();
+            let mut executor = workspace.executor().unwrap();
             let roots: Vec<_> = labels
                 .iter()
                 .map(|label| executor.add_task(label, None))
@@ -519,6 +1003,67 @@ mod tests {
                 workspace_root.display()
             );
         }
+    }
+
+    #[test]
+    fn expands_explicit_targets_and_recursive_patterns() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_workspaces")
+            .join("rand");
+        let workspace = Workspace::load_from(&workspace_root).unwrap();
+
+        assert_eq!(
+            workspace
+                .expand_target_patterns(&vec![
+                    "//app:rand_example".to_string(),
+                    "//app/...".to_string(),
+                    "//app:rand_example".to_string(),
+                ])
+                .unwrap(),
+            vec!["//app:rand_example".to_string()]
+        );
+    }
+
+    #[test]
+    fn expands_workspace_recursive_pattern() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_workspaces")
+            .join("rand");
+        let workspace = Workspace::load_from(&workspace_root).unwrap();
+
+        assert_eq!(
+            workspace
+                .expand_target_patterns(&vec!["//...".to_string()])
+                .unwrap(),
+            vec!["//app:rand_example".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_expansion_only_returns_test_targets() {
+        let workspace_root = test_workspace_with_tests();
+        let workspace = Workspace::load_from(&workspace_root).unwrap();
+
+        assert_eq!(
+            workspace
+                .expand_test_patterns(&vec!["//app/...".to_string()])
+                .unwrap(),
+            vec!["//app:unit".to_string()]
+        );
+        assert_eq!(
+            workspace
+                .expand_test_patterns(&vec!["//app:app".to_string(), "//app:lib".to_string()])
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            workspace
+                .expand_test_patterns(&vec!["//app:unit".to_string()])
+                .unwrap(),
+            vec!["//app:unit".to_string()]
+        );
+
+        std::fs::remove_dir_all(workspace_root).unwrap();
     }
 
     fn test_workspace_roots() -> Vec<PathBuf> {
@@ -581,5 +1126,37 @@ mod tests {
         for child in children {
             collect_workspace_labels(root, &child, labels);
         }
+    }
+
+    fn test_workspace_with_tests() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cbs-workspace-test-expansion-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("WORKSPACE.toml"),
+            "[workspace]\ncache_dir = \".cbs/cache\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("app").join("BUILD.toml"),
+            r#"
+[[rust_library]]
+name = "lib"
+srcs = ["lib.rs"]
+
+[[rust_binary]]
+name = "app"
+srcs = ["main.rs"]
+
+[[rust_test]]
+name = "unit"
+srcs = ["lib.rs"]
+"#,
+        )
+        .unwrap();
+        root
     }
 }
