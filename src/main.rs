@@ -1,7 +1,9 @@
 mod actions;
 #[cfg(test)]
 mod bus;
+#[cfg(test)]
 mod cargo;
+#[cfg(test)]
 mod cargo_recipes;
 mod context;
 mod core;

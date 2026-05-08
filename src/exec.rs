@@ -695,6 +695,11 @@ impl TaskGraph {
 }
 
 fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
+    #[cfg(test)]
+    if let Some(plugin) = load_test_builtin_plugin(path) {
+        return plugin;
+    }
+
     if path.exists() {
         return match crate::plugin_abi::load_build_plugin(path) {
             Ok(plugin) => Arc::new(plugin),
@@ -702,11 +707,6 @@ fn load_plugin(path: &std::path::Path) -> Arc<dyn BuildPlugin> {
                 message: e.to_string(),
             }),
         };
-    }
-
-    #[cfg(test)]
-    if let Some(plugin) = load_test_builtin_plugin(path) {
-        return plugin;
     }
 
     Arc::new(PluginLoadFailure {

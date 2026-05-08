@@ -22,6 +22,15 @@ pub mod build_output_kind {
     pub const TRANSITIVE_PRODUCTS: u32 = 0;
 }
 
+pub mod build_config_key {
+    pub const TARGET_FAMILY: u32 = 1;
+    pub const TARGET_ENV: u32 = 2;
+    pub const TARGET_OS: u32 = 3;
+    pub const TARGET_ARCH: u32 = 4;
+    pub const TARGET_VENDOR: u32 = 5;
+    pub const TARGET_ENDIAN: u32 = 6;
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CbsSlice {
@@ -73,6 +82,8 @@ pub struct CbsPluginV1 {
     pub manifest: extern "C" fn() -> CbsOwnedBuffer,
     pub parse_rule: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
     pub build: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
+    pub plan_dependencies: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
+    pub resolve_target: extern "C" fn(CbsSlice) -> CbsOwnedBuffer,
     pub free_buffer: extern "C" fn(CbsOwnedBuffer),
 }
 
@@ -111,6 +122,14 @@ pub struct ExternalRequirement {
     pub features: Vec<String>,
     pub default_features: bool,
     pub target: Option<String>,
+}
+
+impl ExternalRequirement {
+    pub fn target(&self) -> String {
+        self.target
+            .clone()
+            .unwrap_or_else(|| format!("{}://{}", self.ecosystem, self.package))
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -154,6 +173,170 @@ pub enum ParseRuleResponse {
     Failure(String),
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PluginContext {
+    pub cache_dir: PathBuf,
+    pub context_hash: u64,
+    pub target_config: HashMap<u32, String>,
+    pub lockfile: HashMap<String, String>,
+    pub locked_dependencies: HashMap<String, HashMap<String, String>>,
+    pub target: Option<String>,
+}
+
+impl PluginContext {
+    pub fn get_config(&self, key: u32) -> Option<&str> {
+        self.target_config.get(&key).map(|value| value.as_str())
+    }
+
+    pub fn get_locked_version(&self, target: &str) -> std::io::Result<String> {
+        self.lockfile.get(target).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{target} does not have a lockfile entry!"),
+            )
+        })
+    }
+
+    pub fn get_locked_dependency(&self, target: &str, package: &str) -> Option<String> {
+        self.locked_dependencies
+            .get(target)
+            .and_then(|dependencies| dependencies.get(package))
+            .cloned()
+    }
+
+    pub fn with_target(mut self, target: String) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    pub fn working_directory(&self) -> PathBuf {
+        match self.target.as_ref() {
+            Some(target) => {
+                let version = self.get_locked_version(target).unwrap_or_default();
+                self.cache_dir.join("resolve").join(format!(
+                    "{}-{}",
+                    to_dir(target),
+                    version_dir(&version)
+                ))
+            }
+            None => self.cache_dir.clone(),
+        }
+    }
+
+    pub fn run_process<P: Into<PathBuf>, S>(&self, bin: P, args: &[S]) -> std::io::Result<Vec<u8>>
+    where
+        S: AsRef<str>,
+    {
+        let bin = bin.into();
+        let mut command = std::process::Command::new(&bin);
+        let mut cmd_debug = bin.to_string_lossy().to_string();
+        for arg in args {
+            cmd_debug.push(' ');
+            cmd_debug.push_str(arg.as_ref());
+            command.arg(arg.as_ref());
+        }
+        eprintln!(
+            "[cbs] action {}: {}",
+            self.target.as_deref().unwrap_or("workspace"),
+            command_name(&cmd_debug)
+        );
+        let output = command.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut message = format!(
+                "command exited with {}\ncommand: {cmd_debug}",
+                output.status
+            );
+            if !stderr.trim().is_empty() {
+                message.push_str("\nstderr:\n");
+                message.push_str(stderr.trim_end());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    pub fn download<S: AsRef<str>>(&self, url: S, dest: &Path) -> std::io::Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let args = [
+            "--fail".to_string(),
+            "--location".to_string(),
+            "--silent".to_string(),
+            "--show-error".to_string(),
+            "--output".to_string(),
+            dest.to_string_lossy().to_string(),
+            url.as_ref().to_string(),
+        ];
+        self.run_process("curl", &args).map(|_| ())
+    }
+}
+
+fn to_dir(s: &str) -> String {
+    s.replace("/", "_")
+        .replace(":", "_")
+        .replace("@", "_")
+        .replace(".", "_")
+        .trim_matches('_')
+        .to_string()
+}
+
+fn version_dir(s: &str) -> String {
+    if s.len() <= 64 {
+        return s.to_string();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:x}")
+}
+
+fn command_name(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|bin| Path::new(bin).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DependencyPlan {
+    pub lockfile: HashMap<String, String>,
+    pub locked_dependencies: HashMap<String, HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDependenciesRequest {
+    pub ecosystem: String,
+    pub requirements: Vec<ExternalRequirement>,
+    pub context: PluginContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDependenciesResponse {
+    Success(DependencyPlan),
+    Failure(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveTargetRequest {
+    pub target: String,
+    pub context: PluginContext,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolveTargetResponse {
+    Success(Config),
+    Failure(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifest {
     pub name: String,
@@ -161,6 +344,8 @@ pub struct PluginManifest {
     pub test_rule_kinds: Vec<String>,
     pub build_plugins: Vec<String>,
     pub label_fields: Vec<String>,
+    pub dependency_ecosystems: Vec<String>,
+    pub target_prefixes: Vec<String>,
 }
 
 pub fn encode_config(config: &Config) -> Vec<u8> {
@@ -250,6 +435,57 @@ pub fn decode_parse_rule_response(bytes: &[u8]) -> std::io::Result<ParseRuleResp
     Ok(fb::read_parse_rule_response(response))
 }
 
+pub fn encode_plan_dependencies_request(request: &PlanDependenciesRequest) -> Vec<u8> {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+    let root = fb::create_plan_dependencies_request(&mut fbb, request);
+    fbb.finish_minimal(root);
+    fbb.finished_data().to_vec()
+}
+
+pub fn decode_plan_dependencies_request(bytes: &[u8]) -> std::io::Result<PlanDependenciesRequest> {
+    let request = unsafe { flatbuffers::root_unchecked::<fb::PlanDependenciesRequest<'_>>(bytes) };
+    Ok(fb::read_plan_dependencies_request(request))
+}
+
+pub fn encode_plan_dependencies_response(response: &PlanDependenciesResponse) -> Vec<u8> {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+    let root = fb::create_plan_dependencies_response(&mut fbb, response);
+    fbb.finish_minimal(root);
+    fbb.finished_data().to_vec()
+}
+
+pub fn decode_plan_dependencies_response(
+    bytes: &[u8],
+) -> std::io::Result<PlanDependenciesResponse> {
+    let response =
+        unsafe { flatbuffers::root_unchecked::<fb::PlanDependenciesResponse<'_>>(bytes) };
+    Ok(fb::read_plan_dependencies_response(response))
+}
+
+pub fn encode_resolve_target_request(request: &ResolveTargetRequest) -> Vec<u8> {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+    let root = fb::create_resolve_target_request(&mut fbb, request);
+    fbb.finish_minimal(root);
+    fbb.finished_data().to_vec()
+}
+
+pub fn decode_resolve_target_request(bytes: &[u8]) -> std::io::Result<ResolveTargetRequest> {
+    let request = unsafe { flatbuffers::root_unchecked::<fb::ResolveTargetRequest<'_>>(bytes) };
+    Ok(fb::read_resolve_target_request(request))
+}
+
+pub fn encode_resolve_target_response(response: &ResolveTargetResponse) -> Vec<u8> {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+    let root = fb::create_resolve_target_response(&mut fbb, response);
+    fbb.finish_minimal(root);
+    fbb.finished_data().to_vec()
+}
+
+pub fn decode_resolve_target_response(bytes: &[u8]) -> std::io::Result<ResolveTargetResponse> {
+    let response = unsafe { flatbuffers::root_unchecked::<fb::ResolveTargetResponse<'_>>(bytes) };
+    Ok(fb::read_resolve_target_response(response))
+}
+
 pub fn encode_plugin_manifest(manifest: &PluginManifest) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let root = fb::create_plugin_manifest(&mut fbb, manifest);
@@ -280,9 +516,14 @@ mod fb {
 
     use crate::{
         BuildOutput as CoreBuildOutput, BuildRequest as CoreBuildRequest,
-        BuildResponse as CoreBuildResponse, Config as CoreConfig, ExternalRequirement,
+        BuildResponse as CoreBuildResponse, Config as CoreConfig,
+        DependencyPlan as CoreDependencyPlan, ExternalRequirement,
         ParseRuleRequest as CoreParseRuleRequest, ParseRuleResponse as CoreParseRuleResponse,
-        PluginManifest as CorePluginManifest,
+        PlanDependenciesRequest as CorePlanDependenciesRequest,
+        PlanDependenciesResponse as CorePlanDependenciesResponse,
+        PluginContext as CorePluginContext, PluginManifest as CorePluginManifest,
+        ResolveTargetRequest as CoreResolveTargetRequest,
+        ResolveTargetResponse as CoreResolveTargetResponse,
     };
 
     const VT_FIRST: VOffsetT = 4;
@@ -317,6 +558,13 @@ mod fb {
     table_type!(BuildResponse);
     table_type!(ParseRuleRequest);
     table_type!(ParseRuleResponse);
+    table_type!(PluginContext);
+    table_type!(DependencyEdgeSet);
+    table_type!(DependencyPlan);
+    table_type!(PlanDependenciesRequest);
+    table_type!(PlanDependenciesResponse);
+    table_type!(ResolveTargetRequest);
+    table_type!(ResolveTargetResponse);
 
     type FbStringVector<'a> = Vector<'a, ForwardsUOffset<&'a str>>;
 
@@ -354,6 +602,8 @@ mod fb {
         const VT_BUILD_PLUGINS: VOffsetT = VT_FIRST + 4;
         const VT_LABEL_FIELDS: VOffsetT = VT_FIRST + 6;
         const VT_TEST_RULE_KINDS: VOffsetT = VT_FIRST + 8;
+        const VT_DEPENDENCY_ECOSYSTEMS: VOffsetT = VT_FIRST + 10;
+        const VT_TARGET_PREFIXES: VOffsetT = VT_FIRST + 12;
     }
 
     impl<'a> ExternalRequirementFb<'a> {
@@ -392,6 +642,8 @@ mod fb {
         let test_rule_kinds = create_string_vector(fbb, &manifest.test_rule_kinds);
         let build_plugins = create_string_vector(fbb, &manifest.build_plugins);
         let label_fields = create_string_vector(fbb, &manifest.label_fields);
+        let dependency_ecosystems = create_string_vector(fbb, &manifest.dependency_ecosystems);
+        let target_prefixes = create_string_vector(fbb, &manifest.target_prefixes);
 
         let start = fbb.start_table();
         fbb.push_slot_always(PluginManifest::VT_NAME, name);
@@ -399,6 +651,11 @@ mod fb {
         fbb.push_slot_always(PluginManifest::VT_TEST_RULE_KINDS, test_rule_kinds);
         fbb.push_slot_always(PluginManifest::VT_BUILD_PLUGINS, build_plugins);
         fbb.push_slot_always(PluginManifest::VT_LABEL_FIELDS, label_fields);
+        fbb.push_slot_always(
+            PluginManifest::VT_DEPENDENCY_ECOSYSTEMS,
+            dependency_ecosystems,
+        );
+        fbb.push_slot_always(PluginManifest::VT_TARGET_PREFIXES, target_prefixes);
         finish_table(fbb, start)
     }
 
@@ -425,6 +682,18 @@ mod fb {
             label_fields: string_vector_to_vec(unsafe {
                 manifest.table.get::<ForwardsUOffset<FbStringVector<'_>>>(
                     PluginManifest::VT_LABEL_FIELDS,
+                    None,
+                )
+            }),
+            dependency_ecosystems: string_vector_to_vec(unsafe {
+                manifest.table.get::<ForwardsUOffset<FbStringVector<'_>>>(
+                    PluginManifest::VT_DEPENDENCY_ECOSYSTEMS,
+                    None,
+                )
+            }),
+            target_prefixes: string_vector_to_vec(unsafe {
+                manifest.table.get::<ForwardsUOffset<FbStringVector<'_>>>(
+                    PluginManifest::VT_TARGET_PREFIXES,
                     None,
                 )
             }),
@@ -490,6 +759,58 @@ mod fb {
     }
 
     impl<'a> ParseRuleResponse<'a> {
+        const VT_SUCCESS: VOffsetT = VT_FIRST;
+        const VT_ERROR: VOffsetT = VT_FIRST + 2;
+        const VT_CONFIG: VOffsetT = VT_FIRST + 4;
+    }
+
+    impl<'a> PluginContext<'a> {
+        const VT_CACHE_DIR: VOffsetT = VT_FIRST;
+        const VT_CONTEXT_HASH: VOffsetT = VT_FIRST + 2;
+        const VT_TARGET_CONFIG: VOffsetT = VT_FIRST + 4;
+        const VT_LOCKFILE: VOffsetT = VT_FIRST + 6;
+        const VT_LOCKED_DEPENDENCIES: VOffsetT = VT_FIRST + 8;
+    }
+
+    impl<'a> DependencyEdgeSet<'a> {
+        const VT_TARGET: VOffsetT = VT_FIRST;
+        const VT_DEPENDENCIES: VOffsetT = VT_FIRST + 2;
+
+        fn read(&self) -> (String, HashMap<String, String>) {
+            let dependencies = read_string_fields(unsafe {
+                self.table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<StringField<'_>>>>>(
+                        Self::VT_DEPENDENCIES,
+                        None,
+                    )
+            });
+            (string_slot(self.table, Self::VT_TARGET), dependencies)
+        }
+    }
+
+    impl<'a> DependencyPlan<'a> {
+        const VT_LOCKFILE: VOffsetT = VT_FIRST;
+        const VT_LOCKED_DEPENDENCIES: VOffsetT = VT_FIRST + 2;
+    }
+
+    impl<'a> PlanDependenciesRequest<'a> {
+        const VT_ECOSYSTEM: VOffsetT = VT_FIRST;
+        const VT_REQUIREMENTS: VOffsetT = VT_FIRST + 2;
+        const VT_CONTEXT: VOffsetT = VT_FIRST + 4;
+    }
+
+    impl<'a> PlanDependenciesResponse<'a> {
+        const VT_SUCCESS: VOffsetT = VT_FIRST;
+        const VT_ERROR: VOffsetT = VT_FIRST + 2;
+        const VT_PLAN: VOffsetT = VT_FIRST + 4;
+    }
+
+    impl<'a> ResolveTargetRequest<'a> {
+        const VT_TARGET: VOffsetT = VT_FIRST;
+        const VT_CONTEXT: VOffsetT = VT_FIRST + 2;
+    }
+
+    impl<'a> ResolveTargetResponse<'a> {
         const VT_SUCCESS: VOffsetT = VT_FIRST;
         const VT_ERROR: VOffsetT = VT_FIRST + 2;
         const VT_CONFIG: VOffsetT = VT_FIRST + 4;
@@ -879,6 +1200,276 @@ mod fb {
         }
     }
 
+    pub fn create_plan_dependencies_request<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        request: &CorePlanDependenciesRequest,
+    ) -> WIPOffset<PlanDependenciesRequest<'a>> {
+        let ecosystem = fbb.create_string(&request.ecosystem);
+        let requirements = create_external_requirement_vector(fbb, &request.requirements);
+        let context = create_plugin_context(fbb, &request.context);
+
+        let start = fbb.start_table();
+        fbb.push_slot_always(PlanDependenciesRequest::VT_ECOSYSTEM, ecosystem);
+        fbb.push_slot_always(PlanDependenciesRequest::VT_REQUIREMENTS, requirements);
+        fbb.push_slot_always(PlanDependenciesRequest::VT_CONTEXT, context);
+        finish_table(fbb, start)
+    }
+
+    pub fn read_plan_dependencies_request(
+        request: PlanDependenciesRequest<'_>,
+    ) -> CorePlanDependenciesRequest {
+        let requirements = unsafe {
+            request
+                .table
+                .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<ExternalRequirementFb<'_>>>>>(
+                    PlanDependenciesRequest::VT_REQUIREMENTS,
+                    None,
+                )
+        }
+        .map(|requirements| {
+            requirements
+                .iter()
+                .map(|requirement| requirement.read())
+                .collect()
+        })
+        .unwrap_or_default();
+        let context = unsafe {
+            request.table.get::<ForwardsUOffset<PluginContext<'_>>>(
+                PlanDependenciesRequest::VT_CONTEXT,
+                None,
+            )
+        }
+        .map(read_plugin_context)
+        .unwrap_or_default();
+
+        CorePlanDependenciesRequest {
+            ecosystem: string_slot(request.table, PlanDependenciesRequest::VT_ECOSYSTEM),
+            requirements,
+            context,
+        }
+    }
+
+    pub fn create_plan_dependencies_response<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        response: &CorePlanDependenciesResponse,
+    ) -> WIPOffset<PlanDependenciesResponse<'a>> {
+        let success = matches!(response, CorePlanDependenciesResponse::Success(_));
+        let error = match response {
+            CorePlanDependenciesResponse::Success(_) => None,
+            CorePlanDependenciesResponse::Failure(error) => Some(fbb.create_string(error)),
+        };
+        let plan = match response {
+            CorePlanDependenciesResponse::Success(plan) => Some(create_dependency_plan(fbb, plan)),
+            CorePlanDependenciesResponse::Failure(_) => None,
+        };
+
+        let start = fbb.start_table();
+        fbb.push_slot(PlanDependenciesResponse::VT_SUCCESS, success, false);
+        if let Some(error) = error {
+            fbb.push_slot_always(PlanDependenciesResponse::VT_ERROR, error);
+        }
+        if let Some(plan) = plan {
+            fbb.push_slot_always(PlanDependenciesResponse::VT_PLAN, plan);
+        }
+        finish_table(fbb, start)
+    }
+
+    pub fn read_plan_dependencies_response(
+        response: PlanDependenciesResponse<'_>,
+    ) -> CorePlanDependenciesResponse {
+        let success = unsafe {
+            response
+                .table
+                .get::<bool>(PlanDependenciesResponse::VT_SUCCESS, Some(false))
+                .unwrap_or(false)
+        };
+        if success {
+            let plan = unsafe {
+                response.table.get::<ForwardsUOffset<DependencyPlan<'_>>>(
+                    PlanDependenciesResponse::VT_PLAN,
+                    None,
+                )
+            }
+            .map(read_dependency_plan)
+            .unwrap_or_default();
+            CorePlanDependenciesResponse::Success(plan)
+        } else {
+            CorePlanDependenciesResponse::Failure(string_slot(
+                response.table,
+                PlanDependenciesResponse::VT_ERROR,
+            ))
+        }
+    }
+
+    pub fn create_resolve_target_request<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        request: &CoreResolveTargetRequest,
+    ) -> WIPOffset<ResolveTargetRequest<'a>> {
+        let target = fbb.create_string(&request.target);
+        let context = create_plugin_context(fbb, &request.context);
+
+        let start = fbb.start_table();
+        fbb.push_slot_always(ResolveTargetRequest::VT_TARGET, target);
+        fbb.push_slot_always(ResolveTargetRequest::VT_CONTEXT, context);
+        finish_table(fbb, start)
+    }
+
+    pub fn read_resolve_target_request(
+        request: ResolveTargetRequest<'_>,
+    ) -> CoreResolveTargetRequest {
+        let context = unsafe {
+            request
+                .table
+                .get::<ForwardsUOffset<PluginContext<'_>>>(ResolveTargetRequest::VT_CONTEXT, None)
+        }
+        .map(read_plugin_context)
+        .unwrap_or_default();
+
+        CoreResolveTargetRequest {
+            target: string_slot(request.table, ResolveTargetRequest::VT_TARGET),
+            context,
+        }
+    }
+
+    pub fn create_resolve_target_response<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        response: &CoreResolveTargetResponse,
+    ) -> WIPOffset<ResolveTargetResponse<'a>> {
+        let success = matches!(response, CoreResolveTargetResponse::Success(_));
+        let error = match response {
+            CoreResolveTargetResponse::Success(_) => None,
+            CoreResolveTargetResponse::Failure(error) => Some(fbb.create_string(error)),
+        };
+        let config = match response {
+            CoreResolveTargetResponse::Success(config) => Some(create_config(fbb, config)),
+            CoreResolveTargetResponse::Failure(_) => None,
+        };
+
+        let start = fbb.start_table();
+        fbb.push_slot(ResolveTargetResponse::VT_SUCCESS, success, false);
+        if let Some(error) = error {
+            fbb.push_slot_always(ResolveTargetResponse::VT_ERROR, error);
+        }
+        if let Some(config) = config {
+            fbb.push_slot_always(ResolveTargetResponse::VT_CONFIG, config);
+        }
+        finish_table(fbb, start)
+    }
+
+    pub fn read_resolve_target_response(
+        response: ResolveTargetResponse<'_>,
+    ) -> CoreResolveTargetResponse {
+        let success = unsafe {
+            response
+                .table
+                .get::<bool>(ResolveTargetResponse::VT_SUCCESS, Some(false))
+                .unwrap_or(false)
+        };
+        if success {
+            let config = unsafe {
+                response
+                    .table
+                    .get::<ForwardsUOffset<Config<'_>>>(ResolveTargetResponse::VT_CONFIG, None)
+            }
+            .map(read_config)
+            .unwrap_or_default();
+            CoreResolveTargetResponse::Success(config)
+        } else {
+            CoreResolveTargetResponse::Failure(string_slot(
+                response.table,
+                ResolveTargetResponse::VT_ERROR,
+            ))
+        }
+    }
+
+    fn create_plugin_context<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        context: &CorePluginContext,
+    ) -> WIPOffset<PluginContext<'a>> {
+        let cache_dir = fbb.create_string(&context.cache_dir.display().to_string());
+        let target_config = create_target_config_vector(fbb, &context.target_config);
+        let lockfile = create_string_field_vector(fbb, &context.lockfile);
+        let locked_dependencies =
+            create_locked_dependencies_vector(fbb, &context.locked_dependencies);
+
+        let start = fbb.start_table();
+        fbb.push_slot_always(PluginContext::VT_CACHE_DIR, cache_dir);
+        fbb.push_slot(PluginContext::VT_CONTEXT_HASH, context.context_hash, 0);
+        fbb.push_slot_always(PluginContext::VT_TARGET_CONFIG, target_config);
+        fbb.push_slot_always(PluginContext::VT_LOCKFILE, lockfile);
+        fbb.push_slot_always(PluginContext::VT_LOCKED_DEPENDENCIES, locked_dependencies);
+        finish_table(fbb, start)
+    }
+
+    fn read_plugin_context(context: PluginContext<'_>) -> CorePluginContext {
+        CorePluginContext {
+            cache_dir: PathBuf::from(string_slot(context.table, PluginContext::VT_CACHE_DIR)),
+            context_hash: unsafe {
+                context
+                    .table
+                    .get::<u64>(PluginContext::VT_CONTEXT_HASH, Some(0))
+                    .unwrap_or(0)
+            },
+            target_config: read_target_config(unsafe {
+                context
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<Extra<'_>>>>>(
+                        PluginContext::VT_TARGET_CONFIG,
+                        None,
+                    )
+            }),
+            lockfile: read_string_fields(unsafe {
+                context
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<StringField<'_>>>>>(
+                        PluginContext::VT_LOCKFILE,
+                        None,
+                    )
+            }),
+            locked_dependencies: read_locked_dependencies(unsafe {
+                context
+                    .table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<DependencyEdgeSet<'_>>>>>(
+                        PluginContext::VT_LOCKED_DEPENDENCIES,
+                        None,
+                    )
+            }),
+            target: None,
+        }
+    }
+
+    fn create_dependency_plan<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        plan: &CoreDependencyPlan,
+    ) -> WIPOffset<DependencyPlan<'a>> {
+        let lockfile = create_string_field_vector(fbb, &plan.lockfile);
+        let locked_dependencies = create_locked_dependencies_vector(fbb, &plan.locked_dependencies);
+
+        let start = fbb.start_table();
+        fbb.push_slot_always(DependencyPlan::VT_LOCKFILE, lockfile);
+        fbb.push_slot_always(DependencyPlan::VT_LOCKED_DEPENDENCIES, locked_dependencies);
+        finish_table(fbb, start)
+    }
+
+    fn read_dependency_plan(plan: DependencyPlan<'_>) -> CoreDependencyPlan {
+        CoreDependencyPlan {
+            lockfile: read_string_fields(unsafe {
+                plan.table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<StringField<'_>>>>>(
+                        DependencyPlan::VT_LOCKFILE,
+                        None,
+                    )
+            }),
+            locked_dependencies: read_locked_dependencies(unsafe {
+                plan.table
+                    .get::<ForwardsUOffset<Vector<'_, ForwardsUOffset<DependencyEdgeSet<'_>>>>>(
+                        DependencyPlan::VT_LOCKED_DEPENDENCIES,
+                        None,
+                    )
+            }),
+        }
+    }
+
     fn create_external_requirement_vector<'a>(
         fbb: &mut FlatBufferBuilder<'a>,
         requirements: &[ExternalRequirement],
@@ -991,6 +1582,66 @@ mod fb {
     ) -> HashMap<String, String> {
         fields
             .map(|fields| fields.iter().map(|field| field.read()).collect())
+            .unwrap_or_default()
+    }
+
+    fn create_target_config_vector<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        config: &HashMap<u32, String>,
+    ) -> WIPOffset<Vector<'a, ForwardsUOffset<Extra<'a>>>> {
+        let values: HashMap<_, _> = config
+            .iter()
+            .map(|(key, value)| (*key, vec![value.clone()]))
+            .collect();
+        create_extra_vector(fbb, &values)
+    }
+
+    fn read_target_config(
+        values: Option<Vector<'_, ForwardsUOffset<Extra<'_>>>>,
+    ) -> HashMap<u32, String> {
+        read_extras(values)
+            .into_iter()
+            .filter_map(|(key, values)| values.into_iter().next().map(|value| (key, value)))
+            .collect()
+    }
+
+    fn create_locked_dependencies_vector<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        locked_dependencies: &HashMap<String, HashMap<String, String>>,
+    ) -> WIPOffset<Vector<'a, ForwardsUOffset<DependencyEdgeSet<'a>>>> {
+        let mut locked_dependencies: Vec<_> = locked_dependencies.iter().collect();
+        locked_dependencies.sort_by_key(|(target, _)| target.as_str());
+        let values: Vec<_> = locked_dependencies
+            .into_iter()
+            .map(|(target, dependencies)| create_dependency_edge_set(fbb, target, dependencies))
+            .collect();
+        fbb.create_vector(&values)
+    }
+
+    fn create_dependency_edge_set<'a>(
+        fbb: &mut FlatBufferBuilder<'a>,
+        target: &str,
+        dependencies: &HashMap<String, String>,
+    ) -> WIPOffset<DependencyEdgeSet<'a>> {
+        let target = fbb.create_string(target);
+        let dependencies = create_string_field_vector(fbb, dependencies);
+
+        let start = fbb.start_table();
+        fbb.push_slot_always(DependencyEdgeSet::VT_TARGET, target);
+        fbb.push_slot_always(DependencyEdgeSet::VT_DEPENDENCIES, dependencies);
+        finish_table(fbb, start)
+    }
+
+    fn read_locked_dependencies(
+        dependencies: Option<Vector<'_, ForwardsUOffset<DependencyEdgeSet<'_>>>>,
+    ) -> HashMap<String, HashMap<String, String>> {
+        dependencies
+            .map(|dependencies| {
+                dependencies
+                    .iter()
+                    .map(|dependency| dependency.read())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1167,11 +1818,85 @@ mod tests {
             test_rule_kinds: vec!["example_test".to_string()],
             build_plugins: vec!["@example_plugin".to_string()],
             label_fields: vec!["tool".to_string()],
+            dependency_ecosystems: vec!["example".to_string()],
+            target_prefixes: vec!["example://".to_string()],
         };
 
         assert_eq!(
             decode_plugin_manifest(&encode_plugin_manifest(&manifest)).unwrap(),
             manifest
+        );
+    }
+
+    #[test]
+    fn planner_and_resolver_messages_round_trip() {
+        let mut target_config = HashMap::new();
+        target_config.insert(build_config_key::TARGET_OS, "macos".to_string());
+        let mut lockfile = HashMap::new();
+        lockfile.insert("cargo://rand".to_string(), "0.8.5,std".to_string());
+        let mut locked_dependencies = HashMap::new();
+        locked_dependencies.insert(
+            "cargo://rand".to_string(),
+            [("rand_core".to_string(), "cargo://rand_core".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let context = PluginContext {
+            cache_dir: PathBuf::from("/tmp/cache"),
+            context_hash: 123,
+            target_config,
+            lockfile,
+            locked_dependencies,
+            target: None,
+        };
+        let request = PlanDependenciesRequest {
+            ecosystem: "cargo".to_string(),
+            requirements: vec![ExternalRequirement {
+                ecosystem: "cargo".to_string(),
+                package: "rand".to_string(),
+                version: "=0.8.5".to_string(),
+                features: vec!["std".to_string()],
+                default_features: true,
+                target: None,
+            }],
+            context: context.clone(),
+        };
+        assert_eq!(
+            decode_plan_dependencies_request(&encode_plan_dependencies_request(&request)).unwrap(),
+            request
+        );
+
+        let plan = DependencyPlan {
+            lockfile: context.lockfile.clone(),
+            locked_dependencies: context.locked_dependencies.clone(),
+        };
+        assert_eq!(
+            decode_plan_dependencies_response(&encode_plan_dependencies_response(
+                &PlanDependenciesResponse::Success(plan.clone())
+            ))
+            .unwrap(),
+            PlanDependenciesResponse::Success(plan)
+        );
+
+        let resolve = ResolveTargetRequest {
+            target: "cargo://rand".to_string(),
+            context,
+        };
+        assert_eq!(
+            decode_resolve_target_request(&encode_resolve_target_request(&resolve)).unwrap(),
+            resolve
+        );
+        let config = Config {
+            build_plugin: "@rust_plugin".to_string(),
+            kind: "rust_library".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_resolve_target_response(&encode_resolve_target_response(
+                &ResolveTargetResponse::Success(config.clone())
+            ))
+            .unwrap(),
+            ResolveTargetResponse::Success(config)
         );
     }
 }

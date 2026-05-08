@@ -1,11 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[path = "cargo.rs"]
+mod cargo;
+#[path = "cargo_recipes.rs"]
+mod cargo_recipes;
+
 use cbs_plugin_sdk::{
     build_output_kind, config_extra_keys, decode_build_request, decode_parse_rule_request,
-    encode_build_response, encode_parse_rule_response, encode_plugin_manifest, free_owned_buffer,
-    BuildOutput, BuildRequest, BuildResponse, CbsOwnedBuffer, CbsPluginV1, CbsSlice, Config,
-    ParseRuleRequest, ParseRuleResponse, PluginManifest, CBS_PLUGIN_ABI_VERSION,
+    decode_plan_dependencies_request, decode_resolve_target_request, encode_build_response,
+    encode_parse_rule_response, encode_plan_dependencies_response, encode_plugin_manifest,
+    encode_resolve_target_response, free_owned_buffer, BuildOutput, BuildRequest, BuildResponse,
+    CbsOwnedBuffer, CbsPluginV1, CbsSlice, Config, ParseRuleRequest, ParseRuleResponse,
+    PlanDependenciesResponse, PluginManifest, ResolveTargetResponse, CBS_PLUGIN_ABI_VERSION,
 };
 
 const RUST_LIBRARY: &str = "rust_library";
@@ -19,6 +26,8 @@ pub extern "C" fn cbs_plugin_v1() -> CbsPluginV1 {
         manifest: rust_manifest,
         parse_rule: rust_parse_rule,
         build: rust_build,
+        plan_dependencies: rust_plan_dependencies,
+        resolve_target: rust_resolve_target,
         free_buffer: free_owned_buffer,
     }
 }
@@ -34,6 +43,8 @@ extern "C" fn rust_manifest() -> CbsOwnedBuffer {
         test_rule_kinds: vec![RUST_TEST.to_string()],
         build_plugins: vec!["@rust_plugin".to_string()],
         label_fields: Vec::new(),
+        dependency_ecosystems: vec!["cargo".to_string()],
+        target_prefixes: vec!["cargo://".to_string()],
     }))
 }
 
@@ -51,6 +62,43 @@ extern "C" fn rust_build(request: CbsSlice) -> CbsOwnedBuffer {
         Err(e) => BuildResponse::Failure(format!("failed to decode build request: {e}")),
     };
     CbsOwnedBuffer::from_vec(encode_build_response(&response))
+}
+
+extern "C" fn rust_plan_dependencies(request: CbsSlice) -> CbsOwnedBuffer {
+    let response = match decode_plan_dependencies_request(unsafe { request.as_slice() }) {
+        Ok(request) if request.ecosystem == "cargo" => cargo::CargoDependencyPlanner::new()
+            .plan(request.context, &request.requirements)
+            .map(PlanDependenciesResponse::Success)
+            .unwrap_or_else(|e| PlanDependenciesResponse::Failure(e.to_string())),
+        Ok(request) => PlanDependenciesResponse::Failure(format!(
+            "rust plugin does not plan ecosystem {}",
+            request.ecosystem
+        )),
+        Err(e) => PlanDependenciesResponse::Failure(format!(
+            "failed to decode dependency-plan request: {e}"
+        )),
+    };
+    CbsOwnedBuffer::from_vec(encode_plan_dependencies_response(&response))
+}
+
+extern "C" fn rust_resolve_target(request: CbsSlice) -> CbsOwnedBuffer {
+    let response = match decode_resolve_target_request(unsafe { request.as_slice() }) {
+        Ok(request) if request.target.starts_with("cargo://") => {
+            let context = request.context.with_target(request.target.clone());
+            cargo::CargoResolver::new()
+                .resolve(context, &request.target)
+                .map(ResolveTargetResponse::Success)
+                .unwrap_or_else(|e| ResolveTargetResponse::Failure(e.to_string()))
+        }
+        Ok(request) => ResolveTargetResponse::Failure(format!(
+            "rust plugin does not resolve target {}",
+            request.target
+        )),
+        Err(e) => {
+            ResolveTargetResponse::Failure(format!("failed to decode resolve-target request: {e}"))
+        }
+    };
+    CbsOwnedBuffer::from_vec(encode_resolve_target_response(&response))
 }
 
 fn parse_rust_rule_request(request: ParseRuleRequest) -> ParseRuleResponse {

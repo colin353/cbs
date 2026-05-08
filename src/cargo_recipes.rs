@@ -1,9 +1,15 @@
-use crate::cargo::{CargoBuildRecipe, CargoNativeStaticLib};
-use crate::core::{BuildConfigKey, Context};
+use cbs_plugin_sdk::{build_config_key, PluginContext};
 
-pub fn build_recipe(context: &Context, package: &str, version: &str) -> Option<CargoBuildRecipe> {
+use super::cargo::{CargoBuildRecipe, CargoNativeStaticLib};
+
+pub fn build_recipe(
+    context: &PluginContext,
+    package: &str,
+    version: &str,
+) -> Option<CargoBuildRecipe> {
     match (package, version) {
         ("flatbuffers", "25.12.19")
+        | ("generic-array", "0.14.7")
         | ("httparse", "1.8.0")
         | ("httparse", "1.10.1")
         | ("libc", "0.2.151")
@@ -14,6 +20,7 @@ pub fn build_recipe(context: &Context, package: &str, version: &str) -> Option<C
         | ("rustls", "0.23.31")
         | ("serde", "1.0.193")
         | ("serde", "1.0.228")
+        | ("serde_json", "1.0.117")
         | ("serde_core", "1.0.228")
         | ("slab", "0.4.9")
         | ("slab", "0.4.12")
@@ -31,13 +38,13 @@ pub fn build_recipe(context: &Context, package: &str, version: &str) -> Option<C
     }
 }
 
-fn is_aarch64_apple(context: &Context) -> bool {
-    context.get_config(BuildConfigKey::TargetFamily) == Some("unix")
-        && context.get_config(BuildConfigKey::TargetArch) == Some("aarch64")
-        && context.get_config(BuildConfigKey::TargetVendor) == Some("apple")
-        && context.get_config(BuildConfigKey::TargetEndian) == Some("little")
+fn is_aarch64_apple(context: &PluginContext) -> bool {
+    context.get_config(build_config_key::TARGET_FAMILY) == Some("unix")
+        && context.get_config(build_config_key::TARGET_ARCH) == Some("aarch64")
+        && context.get_config(build_config_key::TARGET_VENDOR) == Some("apple")
+        && context.get_config(build_config_key::TARGET_ENDIAN) == Some("little")
         && matches!(
-            context.get_config(BuildConfigKey::TargetOS),
+            context.get_config(build_config_key::TARGET_OS),
             Some("ios" | "macos" | "tvos" | "visionos" | "watchos")
         )
 }

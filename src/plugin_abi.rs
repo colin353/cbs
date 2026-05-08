@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cbs_plugin_sdk as sdk;
 
 use crate::core::{
-    BuildOutput, BuildPlugin, BuildResult, Config, Context, ExternalRequirement, RuleContext,
-    RulePlugin, Task,
+    BuildConfigKey, BuildOutput, BuildPlugin, BuildResult, Config, Context, DependencyPlan,
+    DependencyPlannerPlugin, ExternalRequirement, ResolverPlugin, RuleContext, RulePlugin, Task,
 };
 
 pub struct AbiRulePlugin {
@@ -85,6 +85,133 @@ impl RulePlugin for AbiRulePlugin {
         match sdk::decode_parse_rule_response(&response)? {
             sdk::ParseRuleResponse::Success(config) => Ok(config_from_sdk(config)),
             sdk::ParseRuleResponse::Failure(error) => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            }
+        }
+    }
+}
+
+pub struct AbiDependencyPlanner {
+    plugin: sdk::CbsPluginV1,
+    ecosystem: String,
+    _library: Option<Arc<libloading::Library>>,
+}
+
+impl std::fmt::Debug for AbiDependencyPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbiDependencyPlanner")
+            .field("abi_version", &self.plugin.abi_version)
+            .field("ecosystem", &self.ecosystem)
+            .finish()
+    }
+}
+
+impl AbiDependencyPlanner {
+    pub fn new(plugin: sdk::CbsPluginV1, ecosystem: String) -> std::io::Result<Self> {
+        validate_abi(plugin)?;
+        Ok(Self {
+            plugin,
+            ecosystem,
+            _library: None,
+        })
+    }
+
+    pub fn with_library(
+        plugin: sdk::CbsPluginV1,
+        ecosystem: String,
+        library: Arc<libloading::Library>,
+    ) -> std::io::Result<Self> {
+        let mut planner = Self::new(plugin, ecosystem)?;
+        planner._library = Some(library);
+        Ok(planner)
+    }
+}
+
+impl DependencyPlannerPlugin for AbiDependencyPlanner {
+    fn ecosystem(&self) -> &str {
+        &self.ecosystem
+    }
+
+    fn plan(
+        &self,
+        context: Context,
+        requirements: &[ExternalRequirement],
+    ) -> std::io::Result<DependencyPlan> {
+        let request = sdk::PlanDependenciesRequest {
+            ecosystem: self.ecosystem.clone(),
+            requirements: requirements
+                .iter()
+                .cloned()
+                .map(external_requirement_to_sdk)
+                .collect(),
+            context: plugin_context_to_sdk(&context),
+        };
+        let request = sdk::encode_plan_dependencies_request(&request);
+        let response_buffer = (self.plugin.plan_dependencies)(sdk::CbsSlice::from_slice(&request));
+        let response = owned_buffer_bytes(response_buffer, self.plugin.free_buffer);
+        match sdk::decode_plan_dependencies_response(&response)? {
+            sdk::PlanDependenciesResponse::Success(plan) => Ok(dependency_plan_from_sdk(plan)),
+            sdk::PlanDependenciesResponse::Failure(error) => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            }
+        }
+    }
+}
+
+pub struct AbiResolverPlugin {
+    plugin: sdk::CbsPluginV1,
+    target_prefixes: Vec<String>,
+    _library: Option<Arc<libloading::Library>>,
+}
+
+impl std::fmt::Debug for AbiResolverPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbiResolverPlugin")
+            .field("abi_version", &self.plugin.abi_version)
+            .field("target_prefixes", &self.target_prefixes)
+            .finish()
+    }
+}
+
+impl AbiResolverPlugin {
+    pub fn new(plugin: sdk::CbsPluginV1, target_prefixes: Vec<String>) -> std::io::Result<Self> {
+        validate_abi(plugin)?;
+        Ok(Self {
+            plugin,
+            target_prefixes,
+            _library: None,
+        })
+    }
+
+    pub fn with_library(
+        plugin: sdk::CbsPluginV1,
+        target_prefixes: Vec<String>,
+        library: Arc<libloading::Library>,
+    ) -> std::io::Result<Self> {
+        let mut resolver = Self::new(plugin, target_prefixes)?;
+        resolver._library = Some(library);
+        Ok(resolver)
+    }
+}
+
+impl ResolverPlugin for AbiResolverPlugin {
+    fn can_resolve(&self, target: &str) -> bool {
+        self.target_prefixes
+            .iter()
+            .any(|prefix| target.starts_with(prefix))
+    }
+
+    fn resolve(&self, context: Context, target: &str) -> std::io::Result<Config> {
+        let request = sdk::ResolveTargetRequest {
+            target: target.to_string(),
+            context: plugin_context_to_sdk(&context.with_target(target)),
+        };
+        let request = sdk::encode_resolve_target_request(&request);
+        let response_buffer = (self.plugin.resolve_target)(sdk::CbsSlice::from_slice(&request));
+        let response = owned_buffer_bytes(response_buffer, self.plugin.free_buffer);
+        match sdk::decode_resolve_target_response(&response)? {
+            sdk::ResolveTargetResponse::Success(config) => Ok(config_from_sdk(config)),
+            sdk::ResolveTargetResponse::Failure(error) => {
                 Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }
         }
@@ -173,8 +300,8 @@ fn load_delegated_rust_plugin() -> std::io::Result<AbiBuildPlugin> {
 
 #[cfg(test)]
 fn load_delegated_rust_plugin() -> std::io::Result<AbiBuildPlugin> {
-    load_build_plugin(Path::new("/tmp/rust.cdylib"))
-        .or_else(|_| AbiBuildPlugin::new(crate::rust_plugin::cbs_plugin_v1()))
+    AbiBuildPlugin::new(crate::rust_plugin::cbs_plugin_v1())
+        .or_else(|_| load_build_plugin(Path::new("/tmp/rust.cdylib")))
 }
 
 #[derive(Debug)]
@@ -360,4 +487,37 @@ fn dependencies_from_sdk(
         .into_iter()
         .map(|(target, output)| (target, build_output_from_sdk(output)))
         .collect()
+}
+
+fn dependency_plan_from_sdk(plan: sdk::DependencyPlan) -> DependencyPlan {
+    DependencyPlan {
+        lockfile: plan.lockfile,
+        locked_dependencies: plan.locked_dependencies,
+    }
+}
+
+fn plugin_context_to_sdk(context: &Context) -> sdk::PluginContext {
+    sdk::PluginContext {
+        cache_dir: context.cache_dir.clone(),
+        context_hash: context.hash,
+        target_config: context
+            .config
+            .iter()
+            .map(|(key, value)| (build_config_key_to_sdk(*key), value.clone()))
+            .collect(),
+        lockfile: context.lockfile.as_ref().clone(),
+        locked_dependencies: context.locked_dependencies.as_ref().clone(),
+        target: context.target.clone(),
+    }
+}
+
+fn build_config_key_to_sdk(key: BuildConfigKey) -> u32 {
+    match key {
+        BuildConfigKey::TargetFamily => sdk::build_config_key::TARGET_FAMILY,
+        BuildConfigKey::TargetEnv => sdk::build_config_key::TARGET_ENV,
+        BuildConfigKey::TargetOS => sdk::build_config_key::TARGET_OS,
+        BuildConfigKey::TargetArch => sdk::build_config_key::TARGET_ARCH,
+        BuildConfigKey::TargetVendor => sdk::build_config_key::TARGET_VENDOR,
+        BuildConfigKey::TargetEndian => sdk::build_config_key::TARGET_ENDIAN,
+    }
 }

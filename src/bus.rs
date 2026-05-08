@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use crate::plugins::plugin_kind;
 use cbs_plugin_sdk::{
     config_extra_keys, decode_build_request, decode_parse_rule_request, encode_build_response,
-    encode_parse_rule_response, encode_plugin_manifest, free_owned_buffer, BuildRequest,
-    BuildResponse, CbsOwnedBuffer, CbsPluginV1, CbsSlice, Config, ExternalRequirement,
-    ParseRuleRequest, ParseRuleResponse, PluginManifest, CBS_PLUGIN_ABI_VERSION,
+    encode_parse_rule_response, encode_plan_dependencies_response, encode_plugin_manifest,
+    encode_resolve_target_response, free_owned_buffer, BuildRequest, BuildResponse, CbsOwnedBuffer,
+    CbsPluginV1, CbsSlice, Config, ExternalRequirement, ParseRuleRequest, ParseRuleResponse,
+    PlanDependenciesResponse, PluginManifest, ResolveTargetResponse, CBS_PLUGIN_ABI_VERSION,
 };
 
 pub fn cbs_plugin_v1() -> CbsPluginV1 {
@@ -14,6 +15,8 @@ pub fn cbs_plugin_v1() -> CbsPluginV1 {
         manifest: bus_manifest,
         parse_rule: bus_parse_rule,
         build: bus_build,
+        plan_dependencies: bus_plan_dependencies,
+        resolve_target: bus_resolve_target,
         free_buffer: free_owned_buffer,
     }
 }
@@ -25,6 +28,8 @@ extern "C" fn bus_manifest() -> CbsOwnedBuffer {
         test_rule_kinds: Vec::new(),
         build_plugins: vec!["@bus_plugin".to_string()],
         label_fields: vec!["bus_runtime".to_string(), "codegen".to_string()],
+        dependency_ecosystems: Vec::new(),
+        target_prefixes: Vec::new(),
     }))
 }
 
@@ -42,6 +47,18 @@ extern "C" fn bus_build(request: CbsSlice) -> CbsOwnedBuffer {
         Err(e) => BuildResponse::Failure(format!("failed to decode build request: {e}")),
     };
     CbsOwnedBuffer::from_vec(encode_build_response(&response))
+}
+
+extern "C" fn bus_plan_dependencies(_request: CbsSlice) -> CbsOwnedBuffer {
+    CbsOwnedBuffer::from_vec(encode_plan_dependencies_response(
+        &PlanDependenciesResponse::Failure("bus plugin does not plan dependencies".to_string()),
+    ))
+}
+
+extern "C" fn bus_resolve_target(_request: CbsSlice) -> CbsOwnedBuffer {
+    CbsOwnedBuffer::from_vec(encode_resolve_target_response(
+        &ResolveTargetResponse::Failure("bus plugin does not resolve targets".to_string()),
+    ))
 }
 
 fn parse_bus_rule_request(request: ParseRuleRequest) -> ParseRuleResponse {

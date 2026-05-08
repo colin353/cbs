@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::cargo::{CargoDependencyPlanner, CargoResolver};
 use crate::core::{
     BuildConfigKey, BuildResult, Config, Context, ExternalRequirement, FakeResolver,
     FilesystemBuilder, ResolverPlugin, RuleContext, RulePlugin,
 };
 use crate::exec::Executor;
-use crate::plugin_abi::{load_dynamic_plugin, AbiRulePlugin, LoadedAbiPlugin};
+use crate::plugin_abi::{
+    load_dynamic_plugin, AbiDependencyPlanner, AbiResolverPlugin, AbiRulePlugin, LoadedAbiPlugin,
+};
 
 #[cfg(test)]
 use crate::plugin_abi::loaded_builtin_plugin;
@@ -86,7 +87,7 @@ impl Workspace {
             current_package: self.current_package.clone(),
             rule_plugins,
         }));
-        executor.add_resolver_plugin(Box::new(CargoResolver::new()));
+        add_plugin_resolvers_and_planners(&mut executor, &loaded_plugins)?;
         let mut tool_configs = vec![
             (
                 "@rust_compiler",
@@ -118,7 +119,6 @@ impl Workspace {
             }
         }
         executor.add_resolver_plugin(Box::new(FakeResolver::with_configs(tool_configs)));
-        executor.add_dependency_planner_plugin(Box::new(CargoDependencyPlanner::new()));
         Ok(executor)
     }
 
@@ -331,10 +331,6 @@ fn load_workspace_dynamic_or_test_plugin(
     path: &Path,
     name: &str,
 ) -> std::io::Result<LoadedAbiPlugin> {
-    if path.exists() {
-        return load_dynamic_plugin(path);
-    }
-
     match name {
         "rust" => loaded_builtin_plugin(crate::rust_plugin::cbs_plugin_v1()),
         "bus" => loaded_builtin_plugin(crate::bus::cbs_plugin_v1()),
@@ -380,6 +376,40 @@ fn rule_plugins(
         plugins.push(Arc::new(rule_plugin));
     }
     Ok(Arc::new(plugins))
+}
+
+fn add_plugin_resolvers_and_planners(
+    executor: &mut Executor,
+    loaded_plugins: &[LoadedWorkspacePlugin],
+) -> std::io::Result<()> {
+    for loaded in loaded_plugins {
+        for ecosystem in &loaded.manifest.dependency_ecosystems {
+            let planner = match loaded.library.as_ref() {
+                Some(library) => AbiDependencyPlanner::with_library(
+                    loaded.plugin,
+                    ecosystem.clone(),
+                    library.clone(),
+                )?,
+                None => AbiDependencyPlanner::new(loaded.plugin, ecosystem.clone())?,
+            };
+            executor.add_dependency_planner_plugin(Box::new(planner));
+        }
+
+        if !loaded.manifest.target_prefixes.is_empty() {
+            let resolver = match loaded.library.as_ref() {
+                Some(library) => AbiResolverPlugin::with_library(
+                    loaded.plugin,
+                    loaded.manifest.target_prefixes.clone(),
+                    library.clone(),
+                )?,
+                None => {
+                    AbiResolverPlugin::new(loaded.plugin, loaded.manifest.target_prefixes.clone())?
+                }
+            };
+            executor.add_resolver_plugin(Box::new(resolver));
+        }
+    }
+    Ok(())
 }
 
 impl ResolverPlugin for WorkspaceResolver {

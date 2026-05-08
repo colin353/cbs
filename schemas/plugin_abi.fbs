@@ -20,6 +20,8 @@ table PluginManifest {
   build_plugins: [string];
   label_fields: [string];
   test_rule_kinds: [string];
+  dependency_ecosystems: [string];
+  target_prefixes: [string];
 }
 
 table ExternalRequirement {
@@ -80,6 +82,47 @@ table ParseRuleRequest {
 }
 
 table ParseRuleResponse {
+  success: bool;
+  error: string;
+  config: Config;
+}
+
+table PluginContext {
+  cache_dir: string;
+  context_hash: ulong;
+  target_config: [Extra];
+  lockfile: [StringField];
+  locked_dependencies: [DependencyEdgeSet];
+}
+
+table DependencyEdgeSet {
+  target: string;
+  dependencies: [StringField];
+}
+
+table DependencyPlan {
+  lockfile: [StringField];
+  locked_dependencies: [DependencyEdgeSet];
+}
+
+table PlanDependenciesRequest {
+  ecosystem: string;
+  requirements: [ExternalRequirement];
+  context: PluginContext;
+}
+
+table PlanDependenciesResponse {
+  success: bool;
+  error: string;
+  plan: DependencyPlan;
+}
+
+table ResolveTargetRequest {
+  target: string;
+  context: PluginContext;
+}
+
+table ResolveTargetResponse {
   success: bool;
   error: string;
   config: Config;

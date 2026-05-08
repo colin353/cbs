@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::Digest;
 
-use crate::cargo_recipes;
-use crate::core::{
-    config_extra_keys, BuildConfigKey, Config, Context, DependencyPlan, DependencyPlannerPlugin,
-    ExternalRequirement, ResolverPlugin,
+use cbs_plugin_sdk::{
+    build_config_key, config_extra_keys, Config, DependencyPlan, ExternalRequirement, PluginContext,
 };
-use crate::plugins::plugin_kind;
+
+use super::cargo_recipes;
+
+const RUST_LIBRARY: &str = "rust_library";
 
 #[derive(Debug)]
 pub struct CargoResolver {
@@ -77,7 +78,7 @@ impl CargoResolver {
 
     fn build_recipe(
         &self,
-        context: &Context,
+        context: &PluginContext,
         target: &str,
         package: &str,
         version: &str,
@@ -198,20 +199,114 @@ impl CargoResolver {
     }
 }
 
+#[cfg(test)]
+impl crate::core::DependencyPlannerPlugin for CargoDependencyPlanner {
+    fn ecosystem(&self) -> &str {
+        CargoDependencyPlanner::ecosystem(self)
+    }
+
+    fn plan(
+        &self,
+        context: crate::core::Context,
+        requirements: &[crate::core::ExternalRequirement],
+    ) -> std::io::Result<crate::core::DependencyPlan> {
+        let requirements: Vec<_> = requirements
+            .iter()
+            .cloned()
+            .map(core_requirement_to_sdk)
+            .collect();
+        let plan =
+            CargoDependencyPlanner::plan(self, core_context_to_sdk(&context), &requirements)?;
+        Ok(crate::core::DependencyPlan {
+            lockfile: plan.lockfile,
+            locked_dependencies: plan.locked_dependencies,
+        })
+    }
+}
+
+#[cfg(test)]
+impl crate::core::ResolverPlugin for CargoResolver {
+    fn can_resolve(&self, target: &str) -> bool {
+        CargoResolver::can_resolve(self, target)
+    }
+
+    fn resolve(
+        &self,
+        context: crate::core::Context,
+        target: &str,
+    ) -> std::io::Result<crate::core::Config> {
+        CargoResolver::resolve(self, core_context_to_sdk(&context), target).map(sdk_config_to_core)
+    }
+}
+
+#[cfg(test)]
+fn core_context_to_sdk(context: &crate::core::Context) -> PluginContext {
+    PluginContext {
+        cache_dir: context.cache_dir.clone(),
+        context_hash: context.hash,
+        target_config: context
+            .config
+            .iter()
+            .map(|(key, value)| (*key as u32, value.clone()))
+            .collect(),
+        lockfile: context.lockfile.as_ref().clone(),
+        locked_dependencies: context.locked_dependencies.as_ref().clone(),
+        target: context.target.clone(),
+    }
+}
+
+#[cfg(test)]
+fn core_requirement_to_sdk(requirement: crate::core::ExternalRequirement) -> ExternalRequirement {
+    ExternalRequirement {
+        ecosystem: requirement.ecosystem,
+        package: requirement.package,
+        version: requirement.version,
+        features: requirement.features,
+        default_features: requirement.default_features,
+        target: requirement.target,
+    }
+}
+
+#[cfg(test)]
+fn sdk_config_to_core(config: Config) -> crate::core::Config {
+    crate::core::Config {
+        dependencies: config.dependencies,
+        external_requirements: config
+            .external_requirements
+            .into_iter()
+            .map(|requirement| crate::core::ExternalRequirement {
+                ecosystem: requirement.ecosystem,
+                package: requirement.package,
+                version: requirement.version,
+                features: requirement.features,
+                default_features: requirement.default_features,
+                target: requirement.target,
+            })
+            .collect(),
+        build_plugin: config.build_plugin,
+        location: config.location,
+        sources: config.sources,
+        build_dependencies: config.build_dependencies,
+        kind: config.kind,
+        extras: config.extras,
+        ..Default::default()
+    }
+}
+
 impl CargoDependencyPlanner {
     pub fn new() -> Self {
         Self {}
     }
 }
 
-impl DependencyPlannerPlugin for CargoDependencyPlanner {
-    fn ecosystem(&self) -> &str {
+impl CargoDependencyPlanner {
+    pub fn ecosystem(&self) -> &str {
         "cargo"
     }
 
-    fn plan(
+    pub fn plan(
         &self,
-        context: Context,
+        context: PluginContext,
         requirements: &[ExternalRequirement],
     ) -> std::io::Result<DependencyPlan> {
         if requirements.is_empty() {
@@ -223,7 +318,7 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
             .cache_dir
             .join("dependency-plans")
             .join("cargo")
-            .join(plan_id(context.hash, requirements));
+            .join(plan_id(context.context_hash, requirements));
         std::fs::create_dir_all(workdir.join("src"))?;
         let plan_cache = workdir.join("plan.json");
         if let Some(plan) = read_cached_dependency_plan(&plan_cache)? {
@@ -247,8 +342,7 @@ impl DependencyPlannerPlugin for CargoDependencyPlanner {
         }
 
         let output = context
-            .actions
-            .run_process(&context, "cargo", &args)
+            .run_process("cargo", &args)
             .map_err(|e| std::io::Error::new(e.kind(), format!("cargo metadata failed: {e}")))?;
         let plan = metadata_to_dependency_plan(&context, requirements, &output)?;
         write_cached_dependency_plan(&plan_cache, &plan)?;
@@ -426,7 +520,7 @@ publish = false
 }
 
 fn metadata_to_dependency_plan(
-    context: &Context,
+    context: &PluginContext,
     requirements: &[ExternalRequirement],
     metadata: &[u8],
 ) -> std::io::Result<DependencyPlan> {
@@ -585,7 +679,7 @@ fn node_features(node: &serde_json::Value) -> std::io::Result<Vec<String>> {
 }
 
 fn validate_metadata_package(
-    context: &Context,
+    context: &PluginContext,
     info: &CargoMetadataPackage,
     features: &[String],
 ) -> std::io::Result<()> {
@@ -612,15 +706,15 @@ fn lockstring(version: &str, features: &[String]) -> String {
     format!("{version},{}", features.join(","))
 }
 
-fn cargo_filter_platform(context: &Context) -> Option<String> {
-    let arch = context.get_config(BuildConfigKey::TargetArch)?;
-    let vendor = context.get_config(BuildConfigKey::TargetVendor)?;
-    let os = match context.get_config(BuildConfigKey::TargetOS)? {
+fn cargo_filter_platform(context: &PluginContext) -> Option<String> {
+    let arch = context.get_config(build_config_key::TARGET_ARCH)?;
+    let vendor = context.get_config(build_config_key::TARGET_VENDOR)?;
+    let os = match context.get_config(build_config_key::TARGET_OS)? {
         "macos" => "darwin",
         os => os,
     };
     let env = context
-        .get_config(BuildConfigKey::TargetEnv)
+        .get_config(build_config_key::TARGET_ENV)
         .unwrap_or_default();
     if env.is_empty() {
         Some(format!("{arch}-{vendor}-{os}"))
@@ -701,7 +795,7 @@ struct LockedPackage {
 }
 
 fn parse_cargo_toml(
-    context: &Context,
+    context: &PluginContext,
     filename: &std::path::Path,
     features: &[&str],
 ) -> std::io::Result<CargoToml> {
@@ -984,7 +1078,7 @@ fn package_string_array(package: &toml::map::Map<String, toml::Value>, key: &str
         .unwrap_or_default()
 }
 
-fn resolve_cfg_directive(context: &Context, directive: &str) -> std::io::Result<bool> {
+fn resolve_cfg_directive(context: &PluginContext, directive: &str) -> std::io::Result<bool> {
     let directive = directive.trim();
     if let Some(args) = strip_cfg_call(directive, "all") {
         for arg in split_cfg_args(args)? {
@@ -1014,21 +1108,21 @@ fn resolve_cfg_directive(context: &Context, directive: &str) -> std::io::Result<
     }
 
     if directive == "unix" {
-        return Ok(context.get_config(BuildConfigKey::TargetFamily) == Some("unix"));
+        return Ok(context.get_config(build_config_key::TARGET_FAMILY) == Some("unix"));
     }
     if directive == "windows" {
-        return Ok(context.get_config(BuildConfigKey::TargetFamily) == Some("windows"));
+        return Ok(context.get_config(build_config_key::TARGET_FAMILY) == Some("windows"));
     }
 
     if let Some((key, value)) = directive.split_once('=') {
         let value = value.trim().trim_matches('"');
         return Ok(match key.trim() {
-            "target_family" => context.get_config(BuildConfigKey::TargetFamily) == Some(value),
-            "target_os" => context.get_config(BuildConfigKey::TargetOS) == Some(value),
-            "target_env" => context.get_config(BuildConfigKey::TargetEnv) == Some(value),
-            "target_arch" => context.get_config(BuildConfigKey::TargetArch) == Some(value),
-            "target_vendor" => context.get_config(BuildConfigKey::TargetVendor) == Some(value),
-            "target_endian" => context.get_config(BuildConfigKey::TargetEndian) == Some(value),
+            "target_family" => context.get_config(build_config_key::TARGET_FAMILY) == Some(value),
+            "target_os" => context.get_config(build_config_key::TARGET_OS) == Some(value),
+            "target_env" => context.get_config(build_config_key::TARGET_ENV) == Some(value),
+            "target_arch" => context.get_config(build_config_key::TARGET_ARCH) == Some(value),
+            "target_vendor" => context.get_config(build_config_key::TARGET_VENDOR) == Some(value),
+            "target_endian" => context.get_config(build_config_key::TARGET_ENDIAN) == Some(value),
             _ => false,
         });
     }
@@ -1179,10 +1273,23 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cbs-{name}-{}", std::process::id()));
+        let module = module_path!().replace("::", "_");
+        let dir = std::env::temp_dir().join(format!("cbs-{module}-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn context<I>(config: I) -> PluginContext
+    where
+        I: IntoIterator<Item = (u32, String)>,
+    {
+        PluginContext {
+            cache_dir: std::env::temp_dir(),
+            context_hash: 0,
+            target_config: config.into_iter().collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1220,14 +1327,11 @@ std = ["serde_alias", "dep:libc"]
         )
         .unwrap();
 
-        let context = Context::new(
-            std::env::temp_dir(),
-            [
-                (BuildConfigKey::TargetFamily, "unix".to_string()),
-                (BuildConfigKey::TargetOS, "linux".to_string()),
-                (BuildConfigKey::TargetEnv, "gnu".to_string()),
-            ],
-        );
+        let context = context([
+            (build_config_key::TARGET_FAMILY, "unix".to_string()),
+            (build_config_key::TARGET_OS, "linux".to_string()),
+            (build_config_key::TARGET_ENV, "gnu".to_string()),
+        ]);
 
         let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &["default"]).unwrap();
         assert_eq!(manifest.crate_name, "demo_lib");
@@ -1274,10 +1378,7 @@ version = "1.0.0"
         )
         .unwrap();
 
-        let context = Context::new(
-            std::env::temp_dir(),
-            std::iter::empty::<(BuildConfigKey, String)>(),
-        );
+        let context = context(std::iter::empty::<(u32, String)>());
         let manifest = parse_cargo_toml(&context, &dir.join("Cargo.toml"), &[]).unwrap();
         assert!(manifest.has_build_script);
 
@@ -1339,12 +1440,12 @@ dependencies = [
     }
 }
 
-impl ResolverPlugin for CargoResolver {
-    fn can_resolve(&self, target: &str) -> bool {
+impl CargoResolver {
+    pub fn can_resolve(&self, target: &str) -> bool {
         target.starts_with("cargo://")
     }
 
-    fn resolve(&self, context: Context, target: &str) -> std::io::Result<Config> {
+    pub fn resolve(&self, context: PluginContext, target: &str) -> std::io::Result<Config> {
         let (crate_name, target_version) = parse_cargo_target(target)?;
 
         let lockstring = match context.get_locked_version(target) {
@@ -1364,8 +1465,7 @@ impl ResolverPlugin for CargoResolver {
         let tar_dest = workdir.join("crate.tar");
 
         if !tar_dest.exists() {
-            context.actions.download(
-                &context,
+            context.download(
                 format!(
                     "https://crates.io/api/v1/crates/{}/{}/download",
                     crate_name, crate_version
@@ -1378,8 +1478,7 @@ impl ResolverPlugin for CargoResolver {
         let dest = workdir.join("crate");
         if !dest.exists() {
             std::fs::create_dir_all(&dest).ok();
-            context.actions.run_process(
-                &context,
+            context.run_process(
                 "tar",
                 &[
                     "xzvf",
@@ -1433,13 +1532,16 @@ impl ResolverPlugin for CargoResolver {
             vec![dest.to_string_lossy().to_string()],
         );
         extras.insert(config_extra_keys::DEPENDENCY_ALIASES, dependency_aliases);
-        extras.insert(
-            config_extra_keys::RUSTC_CFGS,
-            build_recipe
+        extras.insert(config_extra_keys::RUSTC_CFGS, {
+            let mut cfgs = build_recipe
                 .as_ref()
                 .map(|recipe| recipe.rustc_cfgs.clone())
-                .unwrap_or_default(),
-        );
+                .unwrap_or_default();
+            if crate_name == "serde" && crate_version == "1.0.228" {
+                cfgs.push("if_docsrs_then_no_serde_core".to_string());
+            }
+            cfgs
+        });
         extras.insert(
             config_extra_keys::NATIVE_STATIC_LIBS,
             build_recipe
@@ -1453,7 +1555,11 @@ impl ResolverPlugin for CargoResolver {
                 })
                 .unwrap_or_default(),
         );
-        extras.insert(config_extra_keys::RUSTC_ENV, toml.rustc_env);
+        let mut rustc_env = toml.rustc_env;
+        if let Some(out_dir) = hermetic_cargo_out_dir(&workdir, crate_name, crate_version)? {
+            rustc_env.push(format!("OUT_DIR={}", out_dir.display()));
+        }
+        extras.insert(config_extra_keys::RUSTC_ENV, rustc_env);
 
         Ok(Config {
             dependencies: deps,
@@ -1465,9 +1571,49 @@ impl ResolverPlugin for CargoResolver {
                 .map(|s| s.to_string_lossy().to_string())
                 .collect(),
             build_dependencies: vec!["@rust_compiler".to_string()],
-            kind: plugin_kind::RUST_LIBRARY.to_string(),
+            kind: RUST_LIBRARY.to_string(),
             extras,
-            hash: 1010,
         })
+    }
+}
+
+fn hermetic_cargo_out_dir(
+    workdir: &std::path::Path,
+    package: &str,
+    version: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    match (package, version) {
+        ("serde_core", "1.0.228") => {
+            let out_dir = workdir.join("out");
+            std::fs::create_dir_all(&out_dir)?;
+            std::fs::write(
+                out_dir.join("private.rs"),
+                "\
+#[doc(hidden)]
+pub mod __private228 {
+    #[doc(hidden)]
+    pub use crate::private::*;
+}
+",
+            )?;
+            Ok(Some(out_dir))
+        }
+        ("serde", "1.0.228") => {
+            let out_dir = workdir.join("out");
+            std::fs::create_dir_all(&out_dir)?;
+            std::fs::write(
+                out_dir.join("private.rs"),
+                "\
+#[doc(hidden)]
+pub mod __private228 {
+    #[doc(hidden)]
+    pub use crate::private::*;
+}
+use serde_core::__private228 as serde_core_private;
+",
+            )?;
+            Ok(Some(out_dir))
+        }
+        _ => Ok(None),
     }
 }
